@@ -48,3 +48,54 @@ one service.
 - Cheap to reverse until Phase 2 begins, at which point the API acquires real
   handlers, migrations, and integration tests. Revisiting after that is
   expensive.
+
+---
+
+## ADR-002 — Pin the Noir and Barretenberg versions explicitly
+
+**Date:** 2026-08-11
+**Status:** accepted
+
+### Context
+
+The spec (§3) names Noir and Barretenberg but not versions. Installing the
+toolchain the obvious way — `noirup` then `bbup` with no arguments — produced a
+broken pair: `noirup` installed Noir `1.0.0-beta.26`, and `bbup` then failed
+with *"No version specified and couldn't determine version from noir"*.
+
+The cause is that `bbup` resolves a backend by looking up the Noir version in
+Aztec's `bb-versions.json` compatibility map, and that map's newest entry is
+`1.0.0-beta.22`. It lags the Noir release train. Noir is pre-1.0 and its
+serialisation format between `nargo` and `bb` is not yet stable, so an
+arbitrary pairing is not merely unsupported — it can fail at proof generation
+or, worse, at Solidity verifier generation, deep into Phase 1.
+
+Left unpinned, a stranger cloning this repository gets whichever Noir is
+current on the day, and quite possibly no compatible `bb` at all. The spec's
+first definition-of-done item is that a stranger can clone and run the stack.
+
+### Decision
+
+Pin both, to the newest pair the compatibility map actually documents:
+
+| Tool | Version |
+|---|---|
+| `nargo` | `1.0.0-beta.22` |
+| `bb` | `5.0.0-nightly.20260522` |
+| `forge` / `anvil` | `1.7.1` |
+
+The versions become constants in `make setup`, which installs exactly these
+rather than latest, and are stated in the README's prerequisites.
+
+### Consequences
+
+- Reproducible builds for anyone cloning the repository, which is a stated
+  requirement rather than a nicety.
+- Deliberately behind the Noir release train. Upgrading is a conscious act:
+  bump both versions together, re-run the circuit tests, and regenerate the
+  Solidity verifiers, since a verifier is tied to the backend that produced it.
+- A `bb` nightly is not an ideal thing to depend on, but it is what the
+  compatibility map specifies for this Noir release; the alternative is an
+  undocumented pairing, which is worse.
+- Verified working before Phase 1 began: `nargo execute` → `bb write_vk` →
+  `bb prove` → `bb verify` completes and reports the proof valid.
