@@ -1,0 +1,47 @@
+# Local development dependencies for Dray.
+#
+# Postgres is the durable source of truth for job state. Redis holds leases and
+# other ephemeral coordination state and is treated as a cache — it can be
+# flushed at any time and rebuilt from Postgres.
+#
+#   make up     start and wait for both to report healthy
+#   make down   stop and remove containers (volumes survive)
+#   make clean  stop and remove containers *and* volumes
+
+name: dray
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-dray}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dray}
+      POSTGRES_DB: ${POSTGRES_DB:-dray}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dray} -d ${POSTGRES_DB:-dray}"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    # No persistence: Redis is a cache, never truth. Losing it must be survivable.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 2s
+
+volumes:
+  postgres-data:
