@@ -65,14 +65,14 @@ That is the whole list. Everything else below is written but unexecuted.
 
 | Date | Decision | Rationale | Alternatives rejected |
 |------|----------|-----------|----------------------|
-| 2026-08-11 | ADR-001: Rust (axum) for the API and scheduler tier — *proposed, awaiting confirmation* | Spec §4.4 already places `dray-api` under `crates/`; one shared `dray-core` state machine instead of two implementations kept in sync | Go (closer to the author's prior `Sluice`, but adds a second toolchain and duplicates the domain model) |
+| 2026-08-11 | ADR-001: Rust (axum) for the API and scheduler tier — **accepted** | Spec §4.4 already places `dray-api` under `crates/`; one shared `dray-core` state machine instead of two implementations kept in sync | Go (closer to the author's prior `Sluice`, but adds a second toolchain and duplicates the domain model) |
 | 2026-08-11 | Redis runs with persistence disabled in Compose | Redis is a cache, never truth. Making it non-durable in dev forces the recovery path to be exercised rather than assumed | Default RDB snapshotting, which would quietly let Redis become load-bearing |
 | 2026-08-11 | Phase 0 crates carry no third-party dependencies | Keeps the harness itself trivially verifiable; dependencies arrive with the features that need them | Wiring axum, tokio, and sqlx up front, which would make a green build prove less |
 
 ## Open questions (for the human)
 
-- [ ] **ADR-001 — confirm Rust for the API tier**, or switch to Go. Cheap to
-      change now; expensive once Phase 2 handlers and migrations exist.
+- [x] ~~ADR-001 — confirm Rust for the API tier.~~ Answered 2026-08-11: Rust
+      with axum. See ADR-001.
 - [ ] Target testnet: Base Sepolia or Ethereum Sepolia? *(Needed by Phase 4.)*
 - [ ] Is proof batching in scope for v1.0, or deferred to v1.1? *(Needed by
       Phase 4; affects the settlement contract's interface, so worth answering

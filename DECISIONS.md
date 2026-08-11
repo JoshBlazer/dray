@@ -10,7 +10,7 @@ Status values: `proposed` (awaiting the human's confirmation), `accepted`,
 ## ADR-001 — Language for the API and scheduler tier
 
 **Date:** 2026-08-11
-**Status:** proposed — awaiting confirmation from the human (spec §9, question 1)
+**Status:** accepted — confirmed by the human on 2026-08-11 (spec §9, question 1)
 
 ### Context
 
