@@ -2,16 +2,15 @@
 
 **Current phase:** 0 — Foundations
 **Last updated:** 2026-08-11
-**Build status:** red — `cargo build` and `cargo test` have never been executed
-on this machine. There is no C linker installed, so rustc cannot link. `cargo
-fmt --check`, `cargo check`, and `cargo clippy -D warnings` all pass. See
-*Blocked on* below.
+**Build status:** green locally — `make build`, `make test`, and `make lint` all
+pass. Not yet green in CI, which has never run: there is no remote to push to.
+`make up` is still unverified because Docker is unavailable on this machine.
 
 ## Phase status
 
 | Phase | Name | Status | Exit criteria met | Notes |
 |-------|------|--------|-------------------|-------|
-| 0 | Foundations | in progress | no | Scaffolding written; build/test unverified locally, CI never run |
+| 0 | Foundations | in progress | no | Build, test, and lint verified locally. Outstanding: `make up` (no Docker) and CI green on a fresh clone (no remote) |
 | 1 | Circuits and on-chain verification | not started | no | |
 | 2 | Ingest API and durable job store | not started | no | |
 | 3 | Proof worker pool | not started | no | |
@@ -21,11 +20,13 @@ fmt --check`, `cargo check`, and `cargo clippy -D warnings` all pass. See
 
 ## What works right now
 
-Verified by execution on this machine:
+Verified by execution on this machine, via the Makefile targets a reviewer
+would actually run:
 
-- `cargo fmt --all --check` passes.
-- `cargo check --workspace --all-targets` compiles all six crates.
-- `cargo clippy --workspace --all-targets -- -D warnings` is clean.
+- `make setup` succeeds — toolchain components present, dependencies fetched.
+- `make build` compiles all six crates.
+- `make test` passes: 7 tests across 6 crates, 0 failures.
+- `make lint` is clean — `cargo fmt --check` and `cargo clippy -D warnings`.
 
 The proving toolchain is installed, version-pinned per ADR-002, and validated
 end to end on a throwaway circuit outside this repository:
@@ -59,16 +60,14 @@ Learned while validating, and relevant to Phase 1 and Phase 3:
 
 ## What does not work yet
 
-- **`cargo build` and `cargo test` have not been run.** No C linker (`cc`) and
-  no glibc development files are installed, so rustc cannot produce a binary.
-  The trivial per-crate tests exist but have never passed, and Phase 0's exit
-  criteria therefore are **not** met.
-- **`make` is not installed**, so no Makefile target has been executed. The
-  Makefile is written but unverified.
-- **Docker is unavailable.** `/usr/bin/docker` symlinks into
-  `/mnt/wsl/docker-desktop/` and returns an I/O error; Docker Desktop's WSL
-  integration appears to be down. `docker-compose.yml` is written but has never
-  been started, so "Postgres and Redis come up healthy" is a claim, not a fact.
+- **Docker is unavailable, so `make up` has never run.** `docker-compose.yml`
+  is written but has never been started — "Postgres and Redis come up healthy"
+  remains a claim, not a fact, and it is part of Phase 0's exit criteria.
+  Diagnosis: `/mnt/wsl/docker-desktop/cli-tools` is a read-only loopback ISO
+  mount (`/dev/loop0`) that is now empty, so `/usr/bin/docker` — a symlink into
+  it — returns an I/O error. Docker Desktop was shut down on the Windows host
+  and left the mount stale. Restarting Docker Desktop, after a
+  `wsl --shutdown` if the mount persists, should restore it.
 - **CI has never run.** The workflow is committed but there is no remote and no
   push, so the badge-green exit criterion is unmet.
 - Every crate is a skeleton: a component name, a doc comment describing what
@@ -80,14 +79,16 @@ Learned while validating, and relevant to Phase 1 and Phase 3:
 
 ## Blocked on
 
-1. **A C toolchain and `make`** — one command, needs root:
-   `sudo apt-get update && sudo apt-get install -y build-essential`
-   (`build-essential` brings gcc, libc6-dev, and make together.)
-2. **Docker Desktop WSL integration** — start Docker Desktop on Windows and
-   enable integration for this distro, or install `docker.io` and
-   `docker-compose-v2` inside WSL. Needed before `make up` can be verified.
-3. **A GitHub remote** — needed before CI can be observed green, which is part
+1. **Docker** — start Docker Desktop on the Windows host with WSL integration
+   enabled for this distro (`wsl --shutdown` first if the stale mount
+   persists), or install `docker.io` and `docker-compose-v2` inside WSL
+   instead. Needed before `make up` can be verified.
+2. **A GitHub remote** — needed before CI can be observed green, which is part
    of Phase 0's exit criteria.
+
+*Resolved 2026-08-11: the C toolchain and `make` — `build-essential` installed
+gcc 15.2.0, libc6-dev, and GNU Make 4.4.1. `make build`, `make test`, and
+`make lint` now all pass.*
 
 ## Decisions made
 
@@ -111,13 +112,11 @@ Learned while validating, and relevant to Phase 1 and Phase 3:
 
 ## Next actions
 
-1. Install `build-essential`, then run `make build` and `make test` and record
-   the real result here.
-2. Get Docker working, then verify `make up` brings Postgres and Redis to
+1. Get Docker working, then verify `make up` brings Postgres and Redis to
    healthy.
-3. Create the GitHub remote, push, and confirm CI is green on a fresh clone.
-4. Wire the ADR-002 pinned versions into `make setup` so the toolchain installs
+2. Create the GitHub remote, push, and confirm CI is green on a fresh clone.
+3. Wire the ADR-002 pinned versions into `make setup` so the toolchain installs
    reproducibly rather than by hand, and add them to the README prerequisites.
-5. Only then mark Phase 0 done and begin Phase 1 (circuits). The toolchain
+4. Only then mark Phase 0 done and begin Phase 1 (circuits). The toolchain
    install that would have been Phase 1's first task is already done and
    validated; Phase 1 starts directly at writing the Merkle membership circuit.
