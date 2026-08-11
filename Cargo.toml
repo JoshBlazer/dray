@@ -1,0 +1,34 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/dray-api",
+    "crates/dray-cli",
+    "crates/dray-core",
+    "crates/dray-relayer",
+    "crates/dray-store",
+    "crates/dray-worker",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/meli/dray"
+
+[workspace.dependencies]
+dray-core = { path = "crates/dray-core" }
+dray-store = { path = "crates/dray-store" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+todo = "warn"
+unwrap_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

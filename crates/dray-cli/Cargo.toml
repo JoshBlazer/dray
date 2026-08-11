@@ -1,0 +1,19 @@
+[package]
+name = "dray-cli"
+description = "Operator CLI: inspect jobs, replay failures, drain workers, queue stats."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "dray"
+path = "src/main.rs"
+
+[dependencies]
+dray-core.workspace = true
+dray-store.workspace = true
+
+[lints]
+workspace = true

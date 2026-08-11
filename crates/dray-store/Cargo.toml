@@ -1,0 +1,14 @@
+[package]
+name = "dray-store"
+description = "PostgreSQL and Redis adapters. Postgres is truth; Redis is a cache."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dray-core.workspace = true
+
+[lints]
+workspace = true

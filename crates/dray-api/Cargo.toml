@@ -1,0 +1,15 @@
+[package]
+name = "dray-api"
+description = "Ingest HTTP API: validate, canonicalise, dedupe, enqueue."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dray-core.workspace = true
+dray-store.workspace = true
+
+[lints]
+workspace = true
