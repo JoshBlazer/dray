@@ -1,0 +1,30 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Environment and secrets — never commit a key
+.env
+.env.local
+*.pem
+*.key
+
+# Noir / Barretenberg build artefacts
+circuits/**/target/
+circuits/**/proofs/
+
+# Foundry
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+contracts/lib/
+
+# Worker scratch space
+scratch/
+
+# WSL artefacts from files copied off Windows
+*:Zone.Identifier
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
