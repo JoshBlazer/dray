@@ -16,6 +16,19 @@ NOIR_VERSION ?= 1.0.0-beta.22
 BB_VERSION ?= 5.0.0-nightly.20260522
 FOUNDRY_VERSION ?= 1.7.1
 
+# Install locations, stated explicitly rather than inferred.
+#
+# Foundry's installer resolves its directory as $XDG_CONFIG_HOME/.foundry when
+# that variable is set, falling back to $HOME/.foundry otherwise. GitHub's
+# runners set it, so leaving this implicit installs the toolchain somewhere
+# other than where the PATH below looks — which is exactly how this broke in
+# CI while working locally. Pinning FOUNDRY_DIR makes the two agree everywhere.
+FOUNDRY_DIR ?= $(HOME)/.foundry
+NARGO_BIN := $(HOME)/.nargo/bin
+BB_BIN := $(HOME)/.bb
+FOUNDRY_BIN := $(FOUNDRY_DIR)/bin
+ZK_PATH := $(NARGO_BIN):$(BB_BIN):$(FOUNDRY_BIN)
+
 .PHONY: help setup setup-zk versions build test lint fmt up down clean \
         circuits contracts prove e2e-circuits e2e
 
@@ -37,15 +50,15 @@ setup: ## Install toolchain components and verify prerequisites
 	@echo "Rust toolchain ready. For circuits and contracts, run: make setup-zk"
 
 setup-zk: ## Install the pinned Noir, Barretenberg, and Foundry toolchain
-	@command -v noirup >/dev/null || \
+	@test -x "$(NARGO_BIN)/noirup" || \
 		curl -fsSL https://raw.githubusercontent.com/noir-lang/noirup/main/install | bash
-	@command -v bbup >/dev/null || \
+	@test -x "$(BB_BIN)/bbup" || \
 		curl -fsSL https://raw.githubusercontent.com/AztecProtocol/aztec-packages/master/barretenberg/bbup/install | bash
-	@command -v foundryup >/dev/null || \
-		curl -fsSL https://foundry.paradigm.xyz | bash
-	PATH="$$HOME/.nargo/bin:$$HOME/.bb:$$HOME/.foundry/bin:$$PATH" noirup -v $(NOIR_VERSION)
-	PATH="$$HOME/.nargo/bin:$$HOME/.bb:$$HOME/.foundry/bin:$$PATH" bbup -v $(BB_VERSION)
-	PATH="$$HOME/.nargo/bin:$$HOME/.bb:$$HOME/.foundry/bin:$$PATH" foundryup -i v$(FOUNDRY_VERSION)
+	@test -x "$(FOUNDRY_BIN)/foundryup" || \
+		curl -fsSL https://foundry.paradigm.xyz | FOUNDRY_DIR="$(FOUNDRY_DIR)" bash
+	PATH="$(ZK_PATH):$$PATH" "$(NARGO_BIN)/noirup" -v $(NOIR_VERSION)
+	PATH="$(ZK_PATH):$$PATH" "$(BB_BIN)/bbup" -v $(BB_VERSION)
+	PATH="$(ZK_PATH):$$PATH" FOUNDRY_DIR="$(FOUNDRY_DIR)" "$(FOUNDRY_BIN)/foundryup" -i v$(FOUNDRY_VERSION)
 	@echo
 	@echo "Add to your shell profile:"
 	@echo '  export PATH="$$HOME/.nargo/bin:$$HOME/.bb:$$HOME/.foundry/bin:$$PATH"'
