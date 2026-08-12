@@ -510,3 +510,488 @@ async fn queue_depth_counts_queued_jobs() {
         "the global depth must account for at least this test's jobs"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Leasing
+//
+// The properties here are what make at-least-once delivery work without leader
+// election, and they cannot be checked without a real database: the mechanism
+// is `FOR UPDATE SKIP LOCKED` and row-level locking.
+//
+// Unlike the tests above, these need a database of their own. `lease_next`
+// takes the oldest job in the *whole* queue — that is the point of it — so a
+// unique circuit id gives no isolation here, and sibling tests running
+// concurrently would lease each other's jobs. Each test below therefore gets
+// its own database.
+// ---------------------------------------------------------------------------
+
+use std::time::Duration;
+
+/// Creates a database private to one test, migrates it, and returns a store.
+///
+/// Databases are named after the process and the test, so a rerun reuses the
+/// name rather than accumulating them.
+async fn isolated_store(label: &str) -> Store {
+    let admin_url = database_url();
+    let db = format!("dray_lease_{}_{label}", std::process::id());
+
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await
+        .expect("could not connect to Postgres");
+    sqlx::query(&format!(r#"DROP DATABASE IF EXISTS "{db}" WITH (FORCE)"#))
+        .execute(&admin)
+        .await
+        .expect("could not drop the test database");
+    sqlx::query(&format!(r#"CREATE DATABASE "{db}""#))
+        .execute(&admin)
+        .await
+        .expect("could not create the test database");
+    admin.close().await;
+
+    let (prefix, _) = admin_url
+        .rsplit_once('/')
+        .expect("DATABASE_URL should contain a database name");
+    let store = Store::connect(&format!("{prefix}/{db}"), 24)
+        .await
+        .expect("could not connect to the isolated database");
+    store.migrate().await.expect("migrations failed");
+    store
+}
+
+/// Registers a circuit in an isolated store and enqueues `count` jobs.
+async fn seed_jobs(store: &Store, count: usize) -> Vec<uuid::Uuid> {
+    store
+        .upsert_circuit(&Circuit {
+            id: "c".into(),
+            display_name: "test".into(),
+            input_schema: json!({"type": "object"}),
+            verifier_address: None,
+            enabled: true,
+        })
+        .await
+        .expect("could not register circuit");
+
+    let mut ids = Vec::with_capacity(count);
+    for i in 0..count {
+        let (job, _) = store
+            .enqueue("c", &json!({"n": i}), None, 3)
+            .await
+            .expect("enqueue failed");
+        ids.push(job.id);
+    }
+    ids
+}
+
+#[tokio::test]
+async fn leasing_an_empty_queue_returns_nothing() {
+    let store = isolated_store("empty").await;
+    assert!(
+        store
+            .lease_next("worker-1", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn leasing_takes_the_oldest_job_and_counts_the_attempt() {
+    let store = isolated_store("oldest").await;
+    let ids = seed_jobs(&store, 3).await;
+
+    let leased = store
+        .lease_next("worker-1", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("a job should have been available");
+
+    assert_eq!(leased.id, ids[0], "the queue is oldest-first");
+    assert_eq!(leased.state, JobState::Leased);
+    assert_eq!(leased.leased_by.as_deref(), Some("worker-1"));
+    assert_eq!(
+        leased.attempts, 1,
+        "the attempt is counted at lease time, not on completion — a worker \
+         killed mid-proof never reports anything, so counting on success would \
+         let a poison job retry forever"
+    );
+}
+
+#[tokio::test]
+async fn a_leased_job_is_not_offered_again() {
+    let store = isolated_store("not_twice").await;
+    seed_jobs(&store, 1).await;
+
+    assert!(
+        store
+            .lease_next("worker-1", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .lease_next("worker-2", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_none(),
+        "the only job is already held"
+    );
+}
+
+/// The core safety property of the pool: no two workers may hold the same job.
+///
+/// Twenty workers race for ten jobs. Every job must go to exactly one worker.
+/// Without `FOR UPDATE SKIP LOCKED`, this is where duplicate proving work would
+/// appear — and duplicate proving means duplicate settlement attempts.
+#[tokio::test]
+async fn no_two_workers_ever_hold_the_same_job() {
+    let store = isolated_store("contention").await;
+    let expected: std::collections::HashSet<_> = seed_jobs(&store, 10).await.into_iter().collect();
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for worker in 0..20 {
+        let store = store.clone();
+        tasks.spawn(async move {
+            let mut mine = Vec::new();
+            loop {
+                match store
+                    .lease_next(&format!("worker-{worker}"), Duration::from_secs(60))
+                    .await
+                {
+                    Ok(Some(job)) => mine.push(job.id),
+                    Ok(None) => break,
+                    Err(e) => panic!("lease failed: {e}"),
+                }
+            }
+            mine
+        });
+    }
+
+    let mut all = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        all.extend(result.expect("task panicked"));
+    }
+
+    let unique: std::collections::HashSet<_> = all.iter().copied().collect();
+    assert_eq!(
+        all.len(),
+        unique.len(),
+        "a job was leased to more than one worker"
+    );
+    assert_eq!(
+        unique, expected,
+        "every job should have been leased exactly once"
+    );
+}
+
+#[tokio::test]
+async fn only_the_holder_can_renew_a_lease() {
+    let store = isolated_store("renew").await;
+    let ids = seed_jobs(&store, 1).await;
+    store
+        .lease_next("holder", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        store
+            .renew_lease(ids[0], "holder", Duration::from_secs(60))
+            .await
+            .unwrap()
+    );
+
+    // Otherwise a worker whose lease was already reaped could keep heartbeating
+    // a job that now belongs to somebody else.
+    assert!(
+        !store
+            .renew_lease(ids[0], "impostor", Duration::from_secs(60))
+            .await
+            .unwrap(),
+        "a non-holder must not be able to renew"
+    );
+}
+
+/// A worker dying is an ordinary, recoverable event. This is at-least-once
+/// delivery, and it is why no leader election is needed.
+#[tokio::test]
+async fn an_expired_lease_returns_the_job_to_the_queue() {
+    let store = isolated_store("expiry").await;
+    let ids = seed_jobs(&store, 1).await;
+    store
+        .lease_next("doomed-worker", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // As though the worker died a moment ago.
+    sqlx::query("UPDATE jobs SET lease_expires_at = now() - interval '1 second' WHERE id = $1")
+        .bind(ids[0])
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let reaped = store.reap_expired_leases("reaper").await.unwrap();
+    assert_eq!(reaped, vec![ids[0]]);
+
+    let recovered = store.job(ids[0]).await.unwrap().unwrap();
+    assert_eq!(recovered.state, JobState::Queued);
+    assert_eq!(
+        recovered.leased_by, None,
+        "a dead worker's name must not linger"
+    );
+    assert_eq!(
+        recovered.attempts, 1,
+        "the failed attempt still counts against the budget"
+    );
+
+    // And it is immediately available to somebody else.
+    let released = store
+        .lease_next("worker-2", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("the reaped job should be leasable again");
+    assert_eq!(released.id, ids[0]);
+    assert_eq!(released.attempts, 2);
+}
+
+#[tokio::test]
+async fn a_live_lease_is_not_reaped() {
+    let store = isolated_store("live").await;
+    seed_jobs(&store, 1).await;
+    store
+        .lease_next("healthy-worker", Duration::from_secs(300))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        store
+            .reap_expired_leases("reaper")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a lease that has not expired must be left alone"
+    );
+}
+
+#[tokio::test]
+async fn a_successful_proof_is_recorded_with_the_job() {
+    let store = isolated_store("proved").await;
+    let ids = seed_jobs(&store, 1).await;
+    store
+        .lease_next("worker-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    store.begin_proving(ids[0], "worker-1").await.unwrap();
+
+    let proved = store
+        .record_proof(
+            ids[0],
+            "worker-1",
+            b"proof-bytes",
+            b"public-inputs",
+            2470,
+            Some(42_000),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(proved.state, JobState::Proved);
+    assert_eq!(proved.proof.as_deref(), Some(b"proof-bytes".as_slice()));
+    assert_eq!(proved.leased_by, None, "the lease is released once proved");
+
+    // A proved job must never be handed back out for proving.
+    assert!(
+        store
+            .lease_next("worker-2", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_transient_failure_returns_the_job_for_retry() {
+    let store = isolated_store("transient").await;
+    let ids = seed_jobs(&store, 1).await;
+    store
+        .lease_next("worker-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let failed = store
+        .record_failure(
+            ids[0],
+            "worker-1",
+            dray_core::FailureKind::Transient,
+            "bb exited 137",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(failed.state, JobState::Queued, "attempts remain");
+    assert_eq!(failed.last_error.as_deref(), Some("bb exited 137"));
+}
+
+#[tokio::test]
+async fn attempts_are_exhausted_after_the_budget() {
+    let store = isolated_store("exhausted").await;
+    store
+        .upsert_circuit(&Circuit {
+            id: "c".into(),
+            display_name: "test".into(),
+            input_schema: json!({"type": "object"}),
+            verifier_address: None,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let (job, _) = store
+        .enqueue("c", &json!({"budget": 1}), None, 2)
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        store
+            .lease_next("worker-1", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("job should be leasable");
+        store
+            .record_failure(
+                job.id,
+                "worker-1",
+                dray_core::FailureKind::Transient,
+                "transient",
+            )
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        store.job(job.id).await.unwrap().unwrap().state,
+        JobState::Failed,
+        "a job must not be retried forever"
+    );
+}
+
+/// Retrying a malformed input three times costs three times as much and gives
+/// the same answer.
+#[tokio::test]
+async fn a_permanent_failure_is_not_retried() {
+    let store = isolated_store("permanent").await;
+    let ids = seed_jobs(&store, 1).await;
+    store
+        .lease_next("worker-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let failed = store
+        .record_failure(
+            ids[0],
+            "worker-1",
+            dray_core::FailureKind::Permanent,
+            "witness does not satisfy the circuit",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(failed.state, JobState::Failed);
+    assert_eq!(failed.attempts, 1, "it should not have burned the budget");
+}
+
+#[tokio::test]
+async fn a_released_lease_returns_the_job_immediately() {
+    let store = isolated_store("release").await;
+    let ids = seed_jobs(&store, 1).await;
+    store
+        .lease_next("departing-worker", Duration::from_secs(300))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let released = store
+        .release_lease(ids[0], "departing-worker")
+        .await
+        .unwrap();
+
+    // Graceful shutdown must not make the next worker wait out the whole TTL.
+    assert_eq!(released.state, JobState::Queued);
+    assert_eq!(released.leased_by, None);
+    assert!(
+        store
+            .lease_next("worker-2", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// The audit trail must survive a full lease-fail-release cycle, because "where
+/// did this job actually go" is the question that matters during an incident.
+#[tokio::test]
+async fn the_transition_history_records_the_whole_cycle() {
+    let store = isolated_store("history").await;
+    let ids = seed_jobs(&store, 1).await;
+
+    store
+        .lease_next("worker-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    store.begin_proving(ids[0], "worker-1").await.unwrap();
+    store
+        .record_failure(
+            ids[0],
+            "worker-1",
+            dray_core::FailureKind::Transient,
+            "timed out",
+        )
+        .await
+        .unwrap();
+    store
+        .lease_next("worker-2", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    store.begin_proving(ids[0], "worker-2").await.unwrap();
+    store
+        .record_proof(ids[0], "worker-2", b"p", b"pi", 100, None)
+        .await
+        .unwrap();
+
+    let history = store.transitions(ids[0]).await.unwrap();
+    assert_eq!(
+        history,
+        vec![
+            (JobState::Queued, JobEvent::Leased, JobState::Leased),
+            (
+                JobState::Leased,
+                JobEvent::ProvingStarted,
+                JobState::Proving
+            ),
+            (
+                JobState::Proving,
+                JobEvent::RetryScheduled,
+                JobState::Queued
+            ),
+            (JobState::Queued, JobEvent::Leased, JobState::Leased),
+            (
+                JobState::Leased,
+                JobEvent::ProvingStarted,
+                JobState::Proving
+            ),
+            (
+                JobState::Proving,
+                JobEvent::ProofSucceeded,
+                JobState::Proved
+            ),
+        ]
+    );
+}

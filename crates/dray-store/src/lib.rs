@@ -402,6 +402,391 @@ impl Store {
         Job::from_row(&updated)
     }
 
+    // -----------------------------------------------------------------------
+    // Leasing
+    // -----------------------------------------------------------------------
+
+    /// Take the oldest queued job, if there is one, and lease it.
+    ///
+    /// `FOR UPDATE SKIP LOCKED` is what makes this safe with many workers
+    /// polling at once. Each worker locks a different row and skips any row a
+    /// peer already holds, so N workers pulling concurrently get N distinct
+    /// jobs rather than contending for the same one. Without `SKIP LOCKED` they
+    /// would serialise behind the head of the queue and the pool would not
+    /// scale; without `FOR UPDATE` two workers could read the same row and both
+    /// believe they own it.
+    ///
+    /// The attempt counter increments here, at lease time, not on success.
+    /// A worker that is killed mid-proof never gets to report anything, so an
+    /// attempt counted only on completion would never be counted at all and a
+    /// poison job would be retried forever.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures.
+    pub async fn lease_next(
+        &self,
+        worker_id: &str,
+        lease_ttl: std::time::Duration,
+    ) -> Result<Option<Job>, StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        let candidate = sqlx::query(
+            "SELECT id FROM jobs
+             WHERE state = 'queued'
+             ORDER BY created_at
+             FOR UPDATE SKIP LOCKED
+             LIMIT 1",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(row) = candidate else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let id: Uuid = row.try_get("id")?;
+
+        // The state machine decides; this function only persists what it says.
+        let next = transition(JobState::Queued, JobEvent::Leased)?;
+
+        let update = format!(
+            "UPDATE jobs SET
+                 state            = $2::job_state,
+                 leased_by        = $3,
+                 lease_expires_at = now() + make_interval(secs => $4),
+                 attempts         = attempts + 1
+             WHERE id = $1
+             RETURNING {JOB_COLUMNS}"
+        );
+        let leased = sqlx::query(&update)
+            .bind(id)
+            .bind(next.as_str())
+            .bind(worker_id)
+            .bind(lease_ttl.as_secs_f64())
+            .fetch_one(&mut *tx)
+            .await?;
+
+        let job = Job::from_row(&leased)?;
+
+        sqlx::query(
+            "INSERT INTO job_attempts (job_id, attempt_number, worker_id)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (job_id, attempt_number) DO NOTHING",
+        )
+        .bind(id)
+        .bind(job.attempts)
+        .bind(worker_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO job_transitions (job_id, from_state, event, to_state, actor)
+             VALUES ($1, 'queued'::job_state, 'leased'::job_event, $2::job_state, $3)",
+        )
+        .bind(id)
+        .bind(next.as_str())
+        .bind(worker_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(Some(job))
+    }
+
+    /// Extend a lease the caller already holds.
+    ///
+    /// The `leased_by` check is the point: a worker whose lease has already
+    /// expired and been reaped must not be able to reclaim the job by
+    /// heartbeating, because another worker may now own it. Returns `false`
+    /// when the lease was lost, which the caller should treat as an instruction
+    /// to abandon the work in progress.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures.
+    pub async fn renew_lease(
+        &self,
+        id: Uuid,
+        worker_id: &str,
+        lease_ttl: std::time::Duration,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE jobs
+             SET lease_expires_at = now() + make_interval(secs => $3)
+             WHERE id = $1
+               AND leased_by = $2
+               AND state IN ('leased', 'proving')",
+        )
+        .bind(id)
+        .bind(worker_id)
+        .bind(lease_ttl.as_secs_f64())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Return jobs whose leases have expired to the queue.
+    ///
+    /// This is what turns a dead worker into an ordinary, recoverable event.
+    /// Any worker may run it; it is idempotent and safe to run concurrently
+    /// because each row is locked with `SKIP LOCKED` before being touched.
+    ///
+    /// Returns the ids reaped, for logging and metrics.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures.
+    pub async fn reap_expired_leases(&self, reaper: &str) -> Result<Vec<Uuid>, StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        let expired = sqlx::query(
+            "SELECT id, state::text AS state FROM jobs
+             WHERE state IN ('leased', 'proving')
+               AND lease_expires_at < now()
+             FOR UPDATE SKIP LOCKED",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut reaped = Vec::with_capacity(expired.len());
+        for row in &expired {
+            let id: Uuid = row.try_get("id")?;
+            let state_name: String = row.try_get("state")?;
+            let from = JobState::from_str(&state_name)
+                .map_err(|e| StoreError::Corrupt(format!("job.state: {e}")))?;
+            let next = transition(from, JobEvent::LeaseExpired)?;
+
+            sqlx::query(
+                "UPDATE jobs SET
+                     state            = $2::job_state,
+                     leased_by        = NULL,
+                     lease_expires_at = NULL
+                 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(next.as_str())
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "UPDATE job_attempts
+                 SET outcome = 'abandoned', finished_at = now()
+                 WHERE job_id = $1 AND outcome IS NULL",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO job_transitions (job_id, from_state, event, to_state, actor, detail)
+                 VALUES ($1, $2::job_state, 'lease_expired'::job_event, $3::job_state, $4, $5)",
+            )
+            .bind(id)
+            .bind(from.as_str())
+            .bind(next.as_str())
+            .bind(reaper)
+            .bind("lease expired without renewal")
+            .execute(&mut *tx)
+            .await?;
+
+            reaped.push(id);
+        }
+
+        tx.commit().await?;
+        Ok(reaped)
+    }
+
+    /// Mark a leased job as proving.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures and illegal transitions.
+    pub async fn begin_proving(&self, id: Uuid, worker_id: &str) -> Result<Job, StoreError> {
+        self.apply_event(id, JobEvent::ProvingStarted, Some(worker_id), None)
+            .await
+    }
+
+    /// Record a successful proof and move the job to `proved`.
+    ///
+    /// Proof and public inputs are written in the same transaction as the state
+    /// change, because the schema refuses a `proved` job with no proof — the
+    /// two cannot be allowed to disagree even briefly.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures and illegal transitions.
+    pub async fn record_proof(
+        &self,
+        id: Uuid,
+        worker_id: &str,
+        proof: &[u8],
+        public_inputs: &[u8],
+        duration_ms: i64,
+        peak_memory_kb: Option<i64>,
+    ) -> Result<Job, StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        let current =
+            sqlx::query("SELECT state::text AS state, attempts FROM jobs WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(StoreError::JobNotFound(id))?;
+
+        let state_name: String = current.try_get("state")?;
+        let from = JobState::from_str(&state_name)
+            .map_err(|e| StoreError::Corrupt(format!("job.state: {e}")))?;
+        let attempts: i32 = current.try_get("attempts")?;
+        let next = transition(from, JobEvent::ProofSucceeded)?;
+
+        let update = format!(
+            "UPDATE jobs SET
+                 state            = $2::job_state,
+                 proof            = $3,
+                 public_inputs    = $4,
+                 leased_by        = NULL,
+                 lease_expires_at = NULL
+             WHERE id = $1
+             RETURNING {JOB_COLUMNS}"
+        );
+        // Bind order must match the placeholders above: $1 id, $2 state,
+        // $3 proof, $4 public inputs.
+        let updated = sqlx::query(&update)
+            .bind(id)
+            .bind(next.as_str())
+            .bind(proof)
+            .bind(public_inputs)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        sqlx::query(
+            "UPDATE job_attempts SET
+                 outcome        = 'succeeded',
+                 finished_at    = now(),
+                 duration_ms    = $3,
+                 peak_memory_kb = $4
+             WHERE job_id = $1 AND attempt_number = $2",
+        )
+        .bind(id)
+        .bind(attempts)
+        .bind(duration_ms)
+        .bind(peak_memory_kb)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO job_transitions (job_id, from_state, event, to_state, actor)
+             VALUES ($1, $2::job_state, 'proof_succeeded'::job_event, $3::job_state, $4)",
+        )
+        .bind(id)
+        .bind(from.as_str())
+        .bind(next.as_str())
+        .bind(worker_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Job::from_row(&updated)
+    }
+
+    /// Record a failed attempt, letting the retry policy decide what happens.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures and illegal transitions.
+    pub async fn record_failure(
+        &self,
+        id: Uuid,
+        worker_id: &str,
+        kind: dray_core::FailureKind,
+        error: &str,
+    ) -> Result<Job, StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        let current = sqlx::query(
+            "SELECT state::text AS state, attempts, max_attempts FROM jobs WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::JobNotFound(id))?;
+
+        let state_name: String = current.try_get("state")?;
+        let from = JobState::from_str(&state_name)
+            .map_err(|e| StoreError::Corrupt(format!("job.state: {e}")))?;
+        let attempts: i32 = current.try_get("attempts")?;
+        let max_attempts: i32 = current.try_get("max_attempts")?;
+
+        let event = dray_core::classify_failure(
+            kind,
+            attempts.max(0).unsigned_abs(),
+            max_attempts.max(1).unsigned_abs(),
+        );
+        let next = transition(from, event)?;
+
+        let update = format!(
+            "UPDATE jobs SET
+                 state            = $2::job_state,
+                 last_error       = $3,
+                 leased_by        = NULL,
+                 lease_expires_at = NULL
+             WHERE id = $1
+             RETURNING {JOB_COLUMNS}"
+        );
+        let updated = sqlx::query(&update)
+            .bind(id)
+            .bind(next.as_str())
+            .bind(error)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        sqlx::query(
+            "UPDATE job_attempts SET outcome = 'failed', finished_at = now(), error = $3
+             WHERE job_id = $1 AND attempt_number = $2",
+        )
+        .bind(id)
+        .bind(attempts)
+        .bind(error)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO job_transitions (job_id, from_state, event, to_state, actor, detail)
+             VALUES ($1, $2::job_state, $3::job_event, $4::job_state, $5, $6)",
+        )
+        .bind(id)
+        .bind(from.as_str())
+        .bind(event.as_str())
+        .bind(next.as_str())
+        .bind(worker_id)
+        .bind(error)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Job::from_row(&updated)
+    }
+
+    /// Release a lease without failing the job, returning it to the queue.
+    ///
+    /// Used by graceful shutdown: a worker told to stop should hand its job
+    /// back immediately rather than make the next worker wait out the lease TTL.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures and illegal transitions.
+    pub async fn release_lease(&self, id: Uuid, worker_id: &str) -> Result<Job, StoreError> {
+        self.apply_event(
+            id,
+            JobEvent::LeaseExpired,
+            Some(worker_id),
+            Some("released on worker shutdown"),
+        )
+        .await
+    }
+
     /// How many jobs are waiting to be leased. Feeds backpressure and the
     /// queue-depth metric.
     ///
