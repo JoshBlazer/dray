@@ -180,3 +180,113 @@ only.
   under time pressure.
 - Reversible at a cost: adding `settleBatch` later is additive to the contract
   rather than a rewrite, but it would need a redeploy.
+
+---
+
+## ADR-005 — Runtime-checked SQL rather than sqlx's compile-time macros
+
+**Date:** 2026-08-12
+**Status:** accepted
+
+### Context
+
+`sqlx` offers `query!` macros that verify SQL against a live database at
+compile time — genuinely valuable, and the usual recommendation. But they
+require either a running Postgres during `cargo build` or a committed `.sqlx`
+offline cache, and generating that cache needs a database at least once.
+
+The project's first definition-of-done item is that a stranger can clone the
+repository and run it. A build that fails without Docker running contradicts
+that directly.
+
+### Decision
+
+Use `sqlx::query` with runtime-checked SQL. Cover the cost with integration
+tests that exercise every statement in `dray-store` against a real Postgres in
+CI, gated behind a feature flag rather than skipped when `DATABASE_URL` is
+absent.
+
+### Consequences
+
+- `cargo build` and `cargo test` work on a fresh clone with no database.
+- Malformed SQL is caught by tests rather than the compiler. This is not
+  theoretical: the first CI run with a real database found that every job-
+  reading query was broken, because `SELECT *` returns the `job_state` enum and
+  sqlx will not decode that into a `String`. The compiler and 43 unit tests had
+  all passed.
+- The mitigation is that those integration tests are **not allowed to skip**.
+  A runtime skip on missing `DATABASE_URL` would have let that bug ship green,
+  which is precisely the failure this project is supposed to demonstrate
+  avoiding.
+- Revisit once the schema settles: committing a `.sqlx` cache would restore
+  compile-time checking while keeping offline builds working. Worth doing
+  before Phase 5.
+
+---
+
+## ADR-006 — The API is a library with a thin binary
+
+**Date:** 2026-08-12
+**Status:** accepted
+
+### Context
+
+Integration tests need to build the axum router and drive it with
+`tower::ServiceExt::oneshot`. A crate that is only a binary does not expose its
+modules to `tests/`, so the first attempt used `include!` to pull the sources
+into the test — which duplicates compilation, confuses error messages, and
+breaks in obscure ways as soon as two modules refer to each other.
+
+### Decision
+
+`dray-api` is a library crate (`src/lib.rs`) with a thin binary
+(`src/main.rs`) that only reads configuration, wires middleware, and serves.
+
+### Consequences
+
+- Integration tests import `dray_api::api::router` like any other consumer,
+  and exercise real extractors and real handlers rather than a copy of them.
+- Handler logic is testable without binding a socket.
+- The same split will apply to the worker and relayer in Phases 3 and 4, where
+  the chaos tests need to drive internals directly.
+
+---
+
+## ADR-007 — Validation happens at the API boundary, against schemas held as data
+
+**Date:** 2026-08-12
+**Status:** accepted
+
+### Context
+
+Each circuit accepts a different input shape: `membership` wants a secret, an
+index, and exactly twenty siblings; `range_proof` wants a value and a secret.
+Something has to reject a request that cannot possibly satisfy the circuit.
+
+The obvious approach is a per-circuit validator in the API. That makes the API
+the one place in the system that stops being circuit-agnostic — the settlement
+contract dispatches on data (ADR-003), but adding a circuit would still mean an
+API release.
+
+### Decision
+
+Store each circuit's JSON Schema in the `circuits` table and validate against
+it at ingest. Adding a circuit is a row, not a release.
+
+Validation runs in cheapest-first order: identifier shape, then size limits,
+then schema, then canonicalisation. A rejected circuit id must not cost a walk
+over a large body.
+
+### Consequences
+
+- The API stays circuit-agnostic, matching the contract.
+- Impossible requests are rejected before they cost a lease, a subprocess, and
+  a proving attempt — which at ~2.5 s per proof is the expensive resource.
+- Canonicalisation runs during validation, so a float or a duplicate key is
+  reported to the client as a 400 with an explanation rather than surfacing
+  later as a store error with no request context.
+- A malformed schema is an operator error but still surfaces to the client, as
+  a schema-mismatch message saying so. Better than a 500 with nothing useful.
+- The schemas are currently registered by whatever seeds the database. Keeping
+  them in step with the circuits themselves is not yet automated, and that gap
+  is recorded in `PROGRESS.md`.

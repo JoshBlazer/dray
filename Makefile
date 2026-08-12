@@ -29,7 +29,7 @@ BB_BIN := $(HOME)/.bb
 FOUNDRY_BIN := $(FOUNDRY_DIR)/bin
 ZK_PATH := $(NARGO_BIN):$(BB_BIN):$(FOUNDRY_BIN)
 
-.PHONY: help setup setup-zk versions build test lint fmt up down clean \
+.PHONY: help setup setup-zk versions build test test-integration lint fmt up down clean seed api \
         circuits contracts prove e2e-circuits e2e
 
 help: ## Show this help
@@ -91,6 +91,18 @@ down: ## Stop dependencies, keeping volumes
 
 clean: ## Stop dependencies and delete their volumes
 	$(COMPOSE) down -v
+
+DATABASE_URL ?= postgres://dray:dray@localhost:5432/dray
+
+seed: ## Register the circuits with their input schemas
+	psql "$(DATABASE_URL)" -f scripts/seed-circuits.sql
+
+api: ## Run the ingest API against the local dependencies
+	DATABASE_URL="$(DATABASE_URL)" $(CARGO) run -p dray-api
+
+test-integration: ## Run the tests that need a live Postgres (requires make up)
+	DATABASE_URL="$(DATABASE_URL)" $(CARGO) test -p dray-store --features integration-tests
+	DATABASE_URL="$(DATABASE_URL)" $(CARGO) test -p dray-api --features integration-tests
 
 circuits: ## Compile circuits and run their Noir tests
 	cd circuits && nargo compile && nargo test

@@ -106,6 +106,12 @@ jobs:
       - name: Create a database for the integration tests
         run: $PSQL -c "CREATE DATABASE dray_test;"
 
+      # The seed script is what a reviewer runs after `make up`. If it drifts
+      # out of step with the schema, the quickstart breaks for everyone — so it
+      # is executed here rather than merely committed.
+      - name: Seed script applies
+        run: psql -h localhost -U dray -d dray -v ON_ERROR_STOP=1 -f scripts/seed-circuits.sql
+
       # These are the tests that cannot run without a real database:
       # concurrent deduplication, transition serialisation, and the schema's
       # own check constraints. A required job, not an optional one.
@@ -113,6 +119,14 @@ jobs:
         env:
           DATABASE_URL: postgres://dray:dray@localhost:5432/dray_test
         run: cargo test -p dray-store --features integration-tests
+
+      # Drives the real router through real handlers against a real database.
+      # A mocked store would not have caught the enum-decoding bug that the
+      # store's own integration tests did.
+      - name: API integration tests
+        env:
+          DATABASE_URL: postgres://dray:dray@localhost:5432/dray_test
+        run: cargo test -p dray-api --features integration-tests
 
   circuits:
     name: Circuits and contracts
