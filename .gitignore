@@ -16,7 +16,8 @@ circuits/**/proofs/
 contracts/out/
 contracts/cache/
 contracts/broadcast/
-contracts/lib/
+# contracts/lib/ is NOT ignored: forge-std is a git submodule, and ignoring it
+# would leave a fresh clone unable to build the contracts.
 
 # Worker scratch space
 scratch/

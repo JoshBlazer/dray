@@ -16,7 +16,8 @@ NOIR_VERSION ?= 1.0.0-beta.22
 BB_VERSION ?= 5.0.0-nightly.20260522
 FOUNDRY_VERSION ?= 1.7.1
 
-.PHONY: help setup setup-zk versions build test lint fmt up down clean e2e
+.PHONY: help setup setup-zk versions build test lint fmt up down clean \
+        circuits contracts prove e2e-circuits e2e
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -44,7 +45,7 @@ setup-zk: ## Install the pinned Noir, Barretenberg, and Foundry toolchain
 		curl -fsSL https://foundry.paradigm.xyz | bash
 	PATH="$$HOME/.nargo/bin:$$HOME/.bb:$$HOME/.foundry/bin:$$PATH" noirup -v $(NOIR_VERSION)
 	PATH="$$HOME/.nargo/bin:$$HOME/.bb:$$HOME/.foundry/bin:$$PATH" bbup -v $(BB_VERSION)
-	PATH="$$HOME/.nargo/bin:$$HOME/.bb:$$HOME/.foundry/bin:$$PATH" foundryup -i $(FOUNDRY_VERSION)
+	PATH="$$HOME/.nargo/bin:$$HOME/.bb:$$HOME/.foundry/bin:$$PATH" foundryup -i v$(FOUNDRY_VERSION)
 	@echo
 	@echo "Add to your shell profile:"
 	@echo '  export PATH="$$HOME/.nargo/bin:$$HOME/.bb:$$HOME/.foundry/bin:$$PATH"'
@@ -77,6 +78,18 @@ down: ## Stop dependencies, keeping volumes
 
 clean: ## Stop dependencies and delete their volumes
 	$(COMPOSE) down -v
+
+circuits: ## Compile circuits and run their Noir tests
+	cd circuits && nargo compile && nargo test
+
+contracts: ## Build contracts and run the Foundry suite (needs proofs; run make prove)
+	cd contracts && forge build && forge test
+
+prove: ## Generate proofs and Solidity verifiers for every circuit
+	@bash scripts/prove.sh
+
+e2e-circuits: ## Phase 1 end-to-end: input -> proof -> on-chain verification on Anvil
+	@bash scripts/e2e-circuits.sh
 
 e2e: ## End-to-end: API through to on-chain settlement (Phase 4)
 	@echo "make e2e is not implemented yet — it lands in Phase 4."
