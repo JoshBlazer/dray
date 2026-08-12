@@ -68,10 +68,9 @@ jobs:
             $PSQL -f "$f"
           done
 
-      # A migration that only works on an empty database is a migration that
-      # will fail in production. Applying twice must fail loudly rather than
-      # half-succeed, and the runner below re-applies from scratch.
-      - name: Schema matches what the code expects
+      # Prints the resulting schema into the build log, so a reviewer can see
+      # what the migrations actually produced rather than inferring it.
+      - name: Show the resulting schema
         run: |
           $PSQL -c "\d+ jobs"
           $PSQL -c "\d+ job_attempts"
@@ -83,7 +82,7 @@ jobs:
       - name: Postgres job_state matches dray_core::JobState
         run: |
           $PSQL -tAc "SELECT unnest(enum_range(NULL::job_state));" | sort > /tmp/pg_states.txt
-          grep -oP '(?<=JobState::\w{1,20} => ")[a-z_]+(?=")' crates/dray-core/src/job.rs \
+          grep -oP 'JobState::\w+ => "\K[a-z_]+(?=")' crates/dray-core/src/job.rs \
             | sort > /tmp/rust_states.txt
           diff /tmp/pg_states.txt /tmp/rust_states.txt \
             || { echo "job_state enum drift between Postgres and Rust"; exit 1; }
@@ -91,7 +90,7 @@ jobs:
       - name: Postgres job_event matches dray_core::JobEvent
         run: |
           $PSQL -tAc "SELECT unnest(enum_range(NULL::job_event));" | sort > /tmp/pg_events.txt
-          grep -oP '(?<=JobEvent::\w{1,25} => ")[a-z_]+(?=")' crates/dray-core/src/job.rs \
+          grep -oP 'JobEvent::\w+ => "\K[a-z_]+(?=")' crates/dray-core/src/job.rs \
             | sort > /tmp/rust_events.txt
           diff /tmp/pg_events.txt /tmp/rust_events.txt \
             || { echo "job_event enum drift between Postgres and Rust"; exit 1; }
