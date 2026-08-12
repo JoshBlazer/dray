@@ -1,0 +1,21 @@
+# Reference witness for the membership circuit.
+#
+# secret = 42, leaf_index = 5, all siblings = 7.
+#
+# `nullifier` and `root` are Pedersen hashes and cannot be written by hand.
+# They were produced by the circuit itself:
+#
+#   nargo test --show-output print_reference_witness
+#
+# Regenerate them with that command after any change to TREE_DEPTH, the
+# hashing, or the domain separator.
+
+nullifier = "0x04eed209841c67fdb32a39da5ee53038c72465da539eaa32c5964797ba7ab646"
+root = "0x089175ccc891f80d0f76bc5c6f7a239c2a78069ddf64478b68410c7d6b4c7320"
+
+secret = "42"
+leaf_index = "5"
+siblings = [
+    "7", "7", "7", "7", "7", "7", "7", "7", "7", "7",
+    "7", "7", "7", "7", "7", "7", "7", "7", "7", "7",
+]

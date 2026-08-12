@@ -1,0 +1,2 @@
+[workspace]
+members = ["membership", "range_proof"]

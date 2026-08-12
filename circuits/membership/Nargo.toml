@@ -1,0 +1,8 @@
+[package]
+name = "membership"
+type = "bin"
+authors = ["Joshua Willie"]
+# compiler_version is deliberately omitted: Nargo rejects prerelease
+# requirements, and the toolchain is pinned in the Makefile instead (ADR-002).
+
+[dependencies]
