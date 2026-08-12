@@ -41,6 +41,45 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-targets --locked
 
+  circuits:
+    name: Circuits and contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      # Installs the ADR-002 pinned versions. Running the same target a
+      # contributor runs means CI also proves the documented setup works on a
+      # clean machine.
+      - name: Install the pinned proving toolchain
+        run: |
+          make setup-zk
+          echo "$HOME/.nargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.bb" >> "$GITHUB_PATH"
+          echo "$HOME/.foundry/bin" >> "$GITHUB_PATH"
+
+      - name: Report versions
+        run: make versions
+
+      - name: Circuit tests
+        run: make circuits
+
+      - name: Generate proofs and Solidity verifiers
+        run: make prove
+
+      # Fails if `bb write_solidity_verifier` produced something different from
+      # what is committed — which would mean the vendored verifiers no longer
+      # match the circuits they are supposed to verify.
+      - name: Verifiers are in sync with the circuits
+        run: git diff --exit-code -- contracts/src/verifiers/
+
+      - name: Contract tests
+        run: make contracts
+
+      - name: End-to-end against Anvil
+        run: make e2e-circuits
+
   compose:
     name: Dependencies start healthy
     runs-on: ubuntu-latest
