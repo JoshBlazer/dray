@@ -1,9 +1,9 @@
 # Dray — Progress
 
-**Current phase:** 1 — Circuits and on-chain verification (complete) → 2 — Ingest API
+**Current phase:** 2 — Ingest API and durable job store (complete) → 3 — Worker pool
 **Last updated:** 2026-08-12
 **Build status:** green — `make build`, `make test`, and `make lint` pass
-locally, and CI is green on a fresh clone across all three jobs.
+locally, and CI is green on a fresh clone across all five jobs.
 Repository: <https://github.com/JoshBlazer/dray>
 
 ## Phase status
@@ -12,8 +12,8 @@ Repository: <https://github.com/JoshBlazer/dray>
 |-------|------|--------|-------------------|-------|
 | 0 | Foundations | done | yes | CI green on a fresh clone (run 31593551054). One caveat on `make up` — see below |
 | 1 | Circuits and on-chain verification | done | yes | `make e2e-circuits` proves both circuits and settles them on Anvil |
-| 2 | Ingest API and durable job store | not started | no | Needs local Docker for its integration tests |
-| 3 | Proof worker pool | not started | no | |
+| 2 | Ingest API and durable job store | done | yes | Verified in CI against real Postgres; not yet locally (no Docker) |
+| 3 | Proof worker pool | not started | no | Chaos tests need local Docker |
 | 4 | Relayer and on-chain settlement | not started | no | |
 | 5 | Observability, operations, hardening | not started | no | |
 | 6 | Documentation, demo, release | not started | no | |
@@ -25,18 +25,23 @@ would actually run:
 
 - `make setup` succeeds — toolchain components present, dependencies fetched.
 - `make build` compiles all six crates.
-- `make test` passes: 7 tests across 6 crates, 0 failures.
+- `make test` passes: 76 tests across the workspace, 0 failures.
 - `make lint` is clean — `cargo fmt --check` and `cargo clippy -D warnings`.
 - `make versions` reports the installed proving toolchain matching the ADR-002
   pins exactly.
 
-And on CI, from a fresh clone (run 31593551054, all three jobs green):
+And on CI, from a fresh clone, five jobs:
 
-- Build and test — 11 s.
-- Format and clippy — 14 s.
-- Dependencies start healthy — 18 s. This runs `docker compose up -d --wait`,
-  so Postgres and Redis reaching a healthy state is now a verified fact rather
-  than a claim.
+- **Build and test** — the workspace unit and property suites.
+- **Format and clippy** — `-D warnings`.
+- **Dependencies start healthy** — runs `docker compose up -d --wait`, so
+  Postgres and Redis reaching a healthy state is a verified fact, not a claim.
+- **Migrations and store integration** — applies the migrations to a real
+  Postgres, diffs the Postgres enums against the Rust ones, runs the seed
+  script, then the store and API integration suites.
+- **Circuits and contracts** — installs the pinned toolchain, runs the Noir and
+  Foundry suites, asserts the regenerated verifiers match what is committed,
+  and finishes with the full Anvil end-to-end.
 
 **Caveat on `make up`.** The Compose stack is verified by CI on a fresh clone,
 but the `make up` target itself has never been executed on the author's
@@ -76,6 +81,29 @@ but an aggregation circuit would be transformative.
 Both generated verifiers are ~18.1 KB of runtime bytecode, comfortably inside
 the 24,576 B EIP-170 limit but not by so much that it can be ignored — a
 substantially larger circuit could exceed it.
+
+### Phase 2 — ingest API and durable job store
+
+- `dray-core` — the job state machine, 40 tests. All 88 (state, event) pairs
+  covered: 24 legal transitions verified, 64 illegal ones confirmed rejected.
+  The legal table is written longhand in the test rather than derived from the
+  implementation, so the two disagree when either changes. Eight property tests
+  cover arbitrary event sequences.
+- `dray-store` — schema, migrations, and the job repository. 19 integration
+  tests against real Postgres, including the spec's fifty-concurrent-identical-
+  submissions requirement and an eight-worker lease race where exactly one must
+  win.
+- `dray-api` — `POST /v1/proofs`, `GET /v1/proofs/{id}`, and health/readiness
+  probes. 76 unit tests plus 14 HTTP integration tests driving the real router
+  against real Postgres.
+
+Two guarantees live in the database rather than in application code: `job_state`
+is a real Postgres enum, and `jobs.job_hash` is `UNIQUE`. CI diffs the Postgres
+enums against the Rust ones, so drift fails the build.
+
+**Verified in CI, not locally.** Everything database-backed runs in the
+`Migrations and store integration` job. The author's workstation still has no
+Docker, so `make test-integration` has never been executed there.
 
 The toolchain is version-pinned per ADR-002, and `make setup-zk` has been run
 from scratch to confirm it installs exactly those versions rather than latest:
@@ -117,16 +145,20 @@ Relevant to Phase 3, when the worker takes over invoking these tools:
   returns an I/O error. Restarting Docker Desktop did not clear it. The fix
   chosen is to install Docker natively inside WSL rather than depend on
   Desktop's integration; systemd is PID 1 here, so it will run as a service.
-- **Every Rust crate is still a skeleton.** A component name, a doc comment,
-  and one trivial test. No HTTP server, no schema, no state machine, no
-  leasing, no worker, no relayer. Phase 1 built the cryptographic path; none of
-  the distributed machinery exists yet.
+- **The worker and relayer are still skeletons.** A component name, a doc
+  comment, and one trivial test each. Nothing leases a job, nothing proves one,
+  nothing submits one. A job accepted by the API today sits in `queued`
+  forever — the API and store are real, but nothing consumes the queue yet.
+- **The operator CLI is a skeleton.** No subcommands.
 - **Nothing has touched a public testnet.** All on-chain work so far is against
   a local Anvil instance. No deployed addresses, no transaction hashes.
 - **Proving is driven by shell scripts, not by a worker.** `make prove` shells
   out to `nargo` and `bb` with no timeout, no memory ceiling, and no CPU quota.
   Those bounds are Phase 3's central task and the resource-bounding metrics do
   not exist yet.
+- **No leasing, no Redis.** `dray-store` talks only to Postgres. Redis is in
+  the Compose file and nothing uses it.
+- **No metrics, no traces.** Phase 5.
 - `migrations/`, `tests/`, and `docs/` are still empty directories.
 - `make e2e` deliberately exits non-zero with a message; it lands in Phase 4.
 
@@ -184,29 +216,38 @@ gcc 15.2.0, libc6-dev, and GNU Make 4.4.1. `make build`, `make test`, and
 
 ## Next actions
 
-Phase 1 is closed: the cryptographic path works end to end and is proven on
-chain. Phase 2 — the ingest API and durable job store — is next.
+Phase 2 is closed. Phase 3 — the proof worker pool — is next, and it is the
+phase the spec calls out as carrying the single most important engineering
+detail: resource bounding.
 
-1. Schema: `jobs`, `job_attempts`, `circuits`, `settlements`. Unique index on
-   the canonical job hash, explicit state enum, `updated_at` triggers.
-2. Migrations applied automatically on service start in dev.
-3. Implement the job state machine in `dray-core` as pure functions,
-   `transition(state, event) -> Result<state>`, free of I/O so the transition
-   table can be tested exhaustively.
-4. `POST /v1/proofs` — validate against the circuit's declared input schema,
-   canonicalise, hash, dedupe, enqueue, return 202 with a job ID.
-5. `GET /v1/proofs/{id}` — status, attempts, result, settlement tx hash.
-6. Property test with `proptest`: any sequence of valid events leaves the job
-   in a legal state.
-7. Integration tests against real Postgres, including 50 concurrent identical
-   submissions creating exactly one job.
+1. Lease acquisition with `SELECT ... FOR UPDATE SKIP LOCKED`, mirrored into
+   Redis for fast liveness checks. Redis becomes load-bearing for the first
+   time — and must stay rebuildable from Postgres.
+2. Lease renewal heartbeat during long proofs; expiry returns the job to
+   `queued`. The state machine already models this; nothing drives it yet.
+3. Subprocess execution of `nargo`/`bb` under a wall-clock timeout, a memory
+   ceiling, and a CPU quota, with a scratch directory cleaned up on every exit
+   path including panic.
+4. Attempt accounting with exponential backoff and jitter. `classify_failure`
+   in `dray-core` already decides retry-versus-fail; the worker has to call it.
+5. Graceful shutdown on SIGTERM: stop leasing, finish or cleanly abandon the
+   current job, release leases.
+6. Prometheus metrics: queue depth, lease age, proving duration, peak memory,
+   timeouts, OOMs, attempt distribution.
 
-**Docker is now on the critical path.** Phase 2's integration tests need a real
-Postgres, so the workstation Docker fault has to be fixed before Phase 2 can be
-verified locally rather than only in CI.
+**Exit criterion:** a chaos test that randomly kills workers during a 100-job
+run, after which every job has settled exactly once in the store and none are
+lost.
 
-One thing worth carrying forward from Phase 1: the two circuits' input schemas
-(`membership` takes a secret, an index, and 20 siblings; `range_proof` takes a
-value and a secret) are what the API must validate against in task 4. They
-should be declared as data in the `circuits` table, not hardcoded in the
-handler, or the system stops being circuit-agnostic at the API boundary.
+Two things carried forward from earlier phases that Phase 3 depends on:
+
+- `bb` needs the verification key on disk before it will prove, so the worker
+  must generate the vk once per circuit at registration rather than per job.
+- Measured proving cost is 1.9–2.5 s and ~42 MB peak RSS per proof on a
+  4-core box. The default memory ceiling and timeout should be derived from
+  those numbers rather than guessed, with enough headroom that a normal proof
+  never trips them.
+
+**Docker is required for this phase.** The chaos and contention tests need a
+real Postgres and Redis locally; CI alone cannot substitute, because killing
+worker processes mid-proof is the point of the exercise.
