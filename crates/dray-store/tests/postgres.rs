@@ -457,17 +457,56 @@ async fn the_database_refuses_a_proved_job_without_a_proof() {
     assert!(result.is_err(), "check constraint should have refused this");
 }
 
+/// `queue_depth` is global by design — it feeds backpressure, which cares about
+/// total load rather than any one circuit.
+///
+/// That makes it awkward to assert on from a test suite sharing a database:
+/// other tests enqueue and lease jobs concurrently, so the global figure moves
+/// under us. An earlier version of this test compared a global before and after
+/// and passed only by luck.
+///
+/// So the exact assertion is scoped to this test's own circuit, and the global
+/// method is checked for the weaker property that actually holds under
+/// concurrency: it must account for at least the jobs this test queued.
 #[tokio::test]
 async fn queue_depth_counts_queued_jobs() {
     let store = store().await;
     let circuit = fresh_circuit(&store).await;
 
-    let before = store.queue_depth().await.unwrap();
-    store
-        .enqueue(&circuit, &json!({"depth": 1}), None, 3)
-        .await
-        .unwrap();
-    let after = store.queue_depth().await.unwrap();
+    let scoped = |circuit: String| {
+        let store = store.clone();
+        async move {
+            let row = sqlx::query(
+                "SELECT count(*) AS n FROM jobs WHERE circuit_id = $1 AND state = 'queued'",
+            )
+            .bind(&circuit)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            sqlx::Row::try_get::<i64, _>(&row, "n").unwrap()
+        }
+    };
 
-    assert!(after > before, "queue depth should have grown");
+    assert_eq!(
+        scoped(circuit.clone()).await,
+        0,
+        "a fresh circuit starts empty"
+    );
+
+    for i in 0..3 {
+        store
+            .enqueue(&circuit, &json!({"depth": i}), None, 3)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        scoped(circuit.clone()).await,
+        3,
+        "three queued jobs for this circuit"
+    );
+    assert!(
+        store.queue_depth().await.unwrap() >= 3,
+        "the global depth must account for at least this test's jobs"
+    );
 }
