@@ -9,10 +9,17 @@ SHELL := /bin/bash
 CARGO ?= cargo
 COMPOSE ?= docker compose
 
-.PHONY: help setup build test lint fmt up down clean e2e
+# Proving toolchain versions. Pinned deliberately — see ADR-002. Noir is
+# pre-1.0 and its interchange format with the backend is not stable, so nargo
+# and bb must be upgraded together and the Solidity verifiers regenerated.
+NOIR_VERSION ?= 1.0.0-beta.22
+BB_VERSION ?= 5.0.0-nightly.20260522
+FOUNDRY_VERSION ?= 1.7.1
+
+.PHONY: help setup setup-zk versions build test lint fmt up down clean e2e
 
 help: ## Show this help
-	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
+	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
 
 setup: ## Install toolchain components and verify prerequisites
@@ -25,6 +32,29 @@ setup: ## Install toolchain components and verify prerequisites
 		exit 1; }
 	rustup component add rustfmt clippy
 	$(CARGO) fetch
+	@echo
+	@echo "Rust toolchain ready. For circuits and contracts, run: make setup-zk"
+
+setup-zk: ## Install the pinned Noir, Barretenberg, and Foundry toolchain
+	@command -v noirup >/dev/null || \
+		curl -fsSL https://raw.githubusercontent.com/noir-lang/noirup/main/install | bash
+	@command -v bbup >/dev/null || \
+		curl -fsSL https://raw.githubusercontent.com/AztecProtocol/aztec-packages/master/barretenberg/bbup/install | bash
+	@command -v foundryup >/dev/null || \
+		curl -fsSL https://foundry.paradigm.xyz | bash
+	PATH="$$HOME/.nargo/bin:$$HOME/.bb:$$HOME/.foundry/bin:$$PATH" noirup -v $(NOIR_VERSION)
+	PATH="$$HOME/.nargo/bin:$$HOME/.bb:$$HOME/.foundry/bin:$$PATH" bbup -v $(BB_VERSION)
+	PATH="$$HOME/.nargo/bin:$$HOME/.bb:$$HOME/.foundry/bin:$$PATH" foundryup -i $(FOUNDRY_VERSION)
+	@echo
+	@echo "Add to your shell profile:"
+	@echo '  export PATH="$$HOME/.nargo/bin:$$HOME/.bb:$$HOME/.foundry/bin:$$PATH"'
+
+versions: ## Print the versions of every tool this project depends on
+	@echo "expected: nargo $(NOIR_VERSION), bb $(BB_VERSION), foundry $(FOUNDRY_VERSION)"
+	@echo -n "actual:   nargo "; nargo --version 2>/dev/null | grep -oP '(?<=nargo version = ).*' || echo "(not installed)"
+	@echo -n "          bb    "; bb --version 2>/dev/null || echo "(not installed)"
+	@echo -n "          forge "; forge --version 2>/dev/null | grep -oP '(?<=forge Version: ).*' || echo "(not installed)"
+	@echo -n "          cargo "; $(CARGO) --version 2>/dev/null | grep -oP '(?<=cargo ).*' || echo "(not installed)"
 
 build: ## Build the whole workspace
 	$(CARGO) build --workspace --all-targets

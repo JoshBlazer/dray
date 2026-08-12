@@ -1,5 +1,7 @@
 # Dray
 
+[![CI](https://github.com/JoshBlazer/dray/actions/workflows/ci.yml/badge.svg)](https://github.com/JoshBlazer/dray/actions/workflows/ci.yml)
+
 > **Status: in development, Phase 0 of 6.** Nothing below is claimed to work
 > unless `PROGRESS.md` records it as verified. See
 > [PROGRESS.md](PROGRESS.md) for what actually runs today.
@@ -34,14 +36,28 @@ Client → **Ingest API** (validate, canonicalise, hash, dedupe, enqueue) →
 
 ## Quickstart
 
-Prerequisites: Docker, and a Rust toolchain with a C linker.
+Prerequisites: Docker, and a Rust toolchain with a C linker (`build-essential`
+on Debian or Ubuntu).
 
 ```bash
-git clone <repo> && cd dray
+git clone https://github.com/JoshBlazer/dray && cd dray
 make setup    # verify prerequisites, install rustfmt and clippy
 make up       # start Postgres and Redis, wait for healthy
 make test     # run the suite
 ```
+
+For the circuits and contracts, `make setup-zk` installs the proving toolchain
+at the exact pinned versions below; `make versions` reports what you have
+against what is expected.
+
+| Tool | Pinned version | Why pinned |
+|---|---|---|
+| `nargo` | 1.0.0-beta.22 | Noir is pre-1.0; its interchange format with the backend is not yet stable |
+| `bb` | 5.0.0-nightly.20260522 | The backend Aztec's compatibility map pairs with that Noir release |
+| `forge` / `anvil` | 1.7.1 | |
+
+Installing latest-of-both does **not** work today — see
+[ADR-002](DECISIONS.md) for the details.
 
 `make e2e` — clone to first settled proof — arrives in Phase 4.
 

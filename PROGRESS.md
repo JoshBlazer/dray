@@ -1,17 +1,17 @@
 # Dray — Progress
 
-**Current phase:** 0 — Foundations
-**Last updated:** 2026-08-11
-**Build status:** green locally — `make build`, `make test`, and `make lint` all
-pass. Not yet green in CI, which has never run: there is no remote to push to.
-`make up` is still unverified because Docker is unavailable on this machine.
+**Current phase:** 0 — Foundations (complete) → 1 — Circuits
+**Last updated:** 2026-08-12
+**Build status:** green — `make build`, `make test`, and `make lint` pass
+locally, and CI is green on a fresh clone across all three jobs.
+Repository: <https://github.com/JoshBlazer/dray>
 
 ## Phase status
 
 | Phase | Name | Status | Exit criteria met | Notes |
 |-------|------|--------|-------------------|-------|
-| 0 | Foundations | in progress | no | Build, test, and lint verified locally. Outstanding: `make up` (no Docker) and CI green on a fresh clone (no remote) |
-| 1 | Circuits and on-chain verification | not started | no | |
+| 0 | Foundations | done | yes | CI green on a fresh clone (run 31593551054). One caveat on `make up` — see below |
+| 1 | Circuits and on-chain verification | not started | no | Toolchain already installed and proof-verified during Phase 0 |
 | 2 | Ingest API and durable job store | not started | no | |
 | 3 | Proof worker pool | not started | no | |
 | 4 | Relayer and on-chain settlement | not started | no | |
@@ -27,6 +27,21 @@ would actually run:
 - `make build` compiles all six crates.
 - `make test` passes: 7 tests across 6 crates, 0 failures.
 - `make lint` is clean — `cargo fmt --check` and `cargo clippy -D warnings`.
+- `make versions` reports the installed proving toolchain matching the ADR-002
+  pins exactly.
+
+And on CI, from a fresh clone (run 31593551054, all three jobs green):
+
+- Build and test — 11 s.
+- Format and clippy — 14 s.
+- Dependencies start healthy — 18 s. This runs `docker compose up -d --wait`,
+  so Postgres and Redis reaching a healthy state is now a verified fact rather
+  than a claim.
+
+**Caveat on `make up`.** The Compose stack is verified by CI on a fresh clone,
+but the `make up` target itself has never been executed on the author's
+workstation, because Docker is broken there (see below). The target is a
+one-line wrapper around the exact command CI runs. Flagged rather than glossed.
 
 The proving toolchain is installed, version-pinned per ADR-002, and validated
 end to end on a throwaway circuit outside this repository:
@@ -60,16 +75,14 @@ Learned while validating, and relevant to Phase 1 and Phase 3:
 
 ## What does not work yet
 
-- **Docker is unavailable, so `make up` has never run.** `docker-compose.yml`
-  is written but has never been started — "Postgres and Redis come up healthy"
-  remains a claim, not a fact, and it is part of Phase 0's exit criteria.
-  Diagnosis: `/mnt/wsl/docker-desktop/cli-tools` is a read-only loopback ISO
-  mount (`/dev/loop0`) that is now empty, so `/usr/bin/docker` — a symlink into
-  it — returns an I/O error. Docker Desktop was shut down on the Windows host
-  and left the mount stale. Restarting Docker Desktop, after a
-  `wsl --shutdown` if the mount persists, should restore it.
-- **CI has never run.** The workflow is committed but there is no remote and no
-  push, so the badge-green exit criterion is unmet.
+- **Docker is unavailable on the author's workstation**, so `make up` has never
+  been run there. This is an environment fault, not a project one — CI proves
+  the Compose stack comes up healthy from a fresh clone. Diagnosis:
+  `/mnt/wsl/docker-desktop/cli-tools` is a read-only loopback ISO mount
+  (`/dev/loop0`) that is empty, so `/usr/bin/docker` — a symlink into it —
+  returns an I/O error. Restarting Docker Desktop did not clear it. The fix
+  chosen is to install Docker natively inside WSL rather than depend on
+  Desktop's integration; systemd is PID 1 here, so it will run as a service.
 - Every crate is a skeleton: a component name, a doc comment describing what
   will live there, and one trivial test. No HTTP server, no schema, no state
   machine, no proving, no chain code.
@@ -79,12 +92,14 @@ Learned while validating, and relevant to Phase 1 and Phase 3:
 
 ## Blocked on
 
-1. **Docker** — start Docker Desktop on the Windows host with WSL integration
-   enabled for this distro (`wsl --shutdown` first if the stale mount
-   persists), or install `docker.io` and `docker-compose-v2` inside WSL
-   instead. Needed before `make up` can be verified.
-2. **A GitHub remote** — needed before CI can be observed green, which is part
-   of Phase 0's exit criteria.
+1. **Docker on the author's workstation** — needs
+   `sudo apt-get install -y docker.io docker-compose-v2 && sudo systemctl
+   enable --now docker`. Not blocking Phase 0, which CI closed out, but it will
+   block Phase 3's chaos tests and Phase 4's Anvil integration tests, which
+   have to run locally.
+
+*Resolved 2026-08-12: the GitHub remote — <https://github.com/JoshBlazer/dray>,
+pushed, CI green on the first run.*
 
 *Resolved 2026-08-11: the C toolchain and `make` — `build-essential` installed
 gcc 15.2.0, libc6-dev, and GNU Make 4.4.1. `make build`, `make test`, and
@@ -112,11 +127,25 @@ gcc 15.2.0, libc6-dev, and GNU Make 4.4.1. `make build`, `make test`, and
 
 ## Next actions
 
-1. Get Docker working, then verify `make up` brings Postgres and Redis to
-   healthy.
-2. Create the GitHub remote, push, and confirm CI is green on a fresh clone.
-3. Wire the ADR-002 pinned versions into `make setup` so the toolchain installs
-   reproducibly rather than by hand, and add them to the README prerequisites.
-4. Only then mark Phase 0 done and begin Phase 1 (circuits). The toolchain
-   install that would have been Phase 1's first task is already done and
-   validated; Phase 1 starts directly at writing the Merkle membership circuit.
+Phase 0 is closed. Phase 1 — circuits and on-chain verification — is next, and
+the spec is emphatic that it must be fully green before anything downstream
+starts, because discovering a circuit problem in Phase 5 is expensive.
+
+1. Write the Merkle membership circuit: prove a leaf belongs to a tree with a
+   given root without revealing the leaf. Public inputs: root, nullifier.
+2. Write the range proof circuit: prove a private value lies in `[min, max]`.
+   Two circuits are what force the system to be circuit-agnostic from the start.
+3. `nargo test` on both, covering valid *and* invalid witnesses.
+4. Measure proving time and peak memory for each, and record them here. These
+   numbers drive capacity planning and belong in the README.
+5. Generate the Solidity verifier for each circuit.
+6. Write `DraySettlement.sol` — verifier reference, nullifier set, replay
+   rejection, settlement event.
+7. Foundry tests: valid proof verifies, tampered proof reverts, replayed
+   nullifier reverts, malformed calldata reverts, plus a fuzz test over the
+   public input space.
+8. `make e2e-circuits` — input → proof → on-chain verification against Anvil,
+   with no service tier involved.
+
+Docker is not needed for Phase 1 (Anvil runs natively), so the local Docker gap
+does not block this work. It will block Phase 3.
