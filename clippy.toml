@@ -1,0 +1,10 @@
+# The workspace denies `unwrap_used` and `expect_used` in production code: a
+# panic in a worker takes down whatever job it was holding, and a panic in the
+# API drops a request.
+#
+# Tests are the opposite case. There, `unwrap()` is how a test asserts that a
+# precondition held, and forcing `match` around every fixture would bury the
+# assertion being made.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

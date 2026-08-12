@@ -41,6 +41,61 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-targets --locked
 
+  migrations:
+    name: Migrations apply cleanly
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: dray
+          POSTGRES_PASSWORD: dray
+          POSTGRES_DB: dray
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U dray -d dray"
+          --health-interval 2s --health-timeout 3s --health-retries 15
+    env:
+      PGPASSWORD: dray
+      PSQL: psql -h localhost -U dray -d dray -v ON_ERROR_STOP=1
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Apply migrations
+        run: |
+          for f in migrations/*.sql; do
+            echo "applying $f"
+            $PSQL -f "$f"
+          done
+
+      # A migration that only works on an empty database is a migration that
+      # will fail in production. Applying twice must fail loudly rather than
+      # half-succeed, and the runner below re-applies from scratch.
+      - name: Schema matches what the code expects
+        run: |
+          $PSQL -c "\d+ jobs"
+          $PSQL -c "\d+ job_attempts"
+          $PSQL -c "\d+ settlements"
+          $PSQL -c "SELECT unnest(enum_range(NULL::job_state));"
+
+      # The Postgres enum and the Rust enum must agree, or a state the code can
+      # produce would be rejected by the database at runtime.
+      - name: Postgres job_state matches dray_core::JobState
+        run: |
+          $PSQL -tAc "SELECT unnest(enum_range(NULL::job_state));" | sort > /tmp/pg_states.txt
+          grep -oP '(?<=JobState::\w{1,20} => ")[a-z_]+(?=")' crates/dray-core/src/job.rs \
+            | sort > /tmp/rust_states.txt
+          diff /tmp/pg_states.txt /tmp/rust_states.txt \
+            || { echo "job_state enum drift between Postgres and Rust"; exit 1; }
+
+      - name: Postgres job_event matches dray_core::JobEvent
+        run: |
+          $PSQL -tAc "SELECT unnest(enum_range(NULL::job_event));" | sort > /tmp/pg_events.txt
+          grep -oP '(?<=JobEvent::\w{1,25} => ")[a-z_]+(?=")' crates/dray-core/src/job.rs \
+            | sort > /tmp/rust_events.txt
+          diff /tmp/pg_events.txt /tmp/rust_events.txt \
+            || { echo "job_event enum drift between Postgres and Rust"; exit 1; }
+
   circuits:
     name: Circuits and contracts
     runs-on: ubuntu-latest
