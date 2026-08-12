@@ -99,3 +99,84 @@ rather than latest, and are stated in the README's prerequisites.
   undocumented pairing, which is worse.
 - Verified working before Phase 1 began: `nargo execute` → `bb write_vk` →
   `bb prove` → `bb verify` completes and reports the proof valid.
+
+---
+
+## ADR-003 — Nullifier is public input 0 for every circuit
+
+**Date:** 2026-08-12
+**Status:** accepted
+
+### Context
+
+The spec requires Dray to be circuit-agnostic — supporting at least two
+circuits specifically to prove the system is not hardcoded to one — and
+separately requires the settlement contract to reject replayed proofs via a
+nullifier set.
+
+These pull against each other. The contract must read a nullifier out of a
+proof's public inputs, but the public inputs of the membership circuit
+(`root`) and the range proof (`min`, `max`) have nothing else in common. A
+contract that switched on circuit identity to find the nullifier would need
+changing every time a circuit was added, which is the opposite of
+circuit-agnostic.
+
+### Decision
+
+Every Dray circuit declares `nullifier` as its **first** public input.
+
+`DraySettlement.sol` reads `publicInputs[0]` as the nullifier without knowing
+or caring which circuit produced the proof. Everything after index 0 is
+circuit-specific and opaque to the contract; the verifier checks it.
+
+Each circuit derives its nullifier under its own domain separator — the ASCII
+bytes of `dray_membership_nullifier` and `dray_range_nullifier` respectively —
+so one secret reused across circuits does not collide in the shared nullifier
+set and block itself.
+
+### Consequences
+
+- Adding a circuit needs no settlement contract change: register a verifier
+  address, and the nullifier is found at a known offset.
+- The convention is load-bearing but invisible to the compiler. A new circuit
+  that declares its public inputs in the wrong order would have the contract
+  treat some other field as a nullifier. Mitigated by documenting it at the top
+  of every circuit and asserting it in the Foundry tests, but it is a real
+  sharp edge and belongs in `docs/DESIGN.md`.
+- The nullifier set is global rather than per-circuit. Domain separation is
+  what keeps that safe, so the domain separators are a correctness requirement,
+  not decoration.
+
+---
+
+## ADR-004 — Proof batching deferred to v1.1
+
+**Date:** 2026-08-12
+**Status:** accepted — decided by the human (spec §9, question 3)
+
+### Context
+
+The spec lists batching multiple proofs into one transaction as an optional
+Phase 4 task, and §9 asks whether it is in scope for v1.0. It affects the
+settlement contract's interface, so it is cheaper to settle before
+`DraySettlement.sol` exists than after.
+
+### Decision
+
+Defer batching to v1.1. `DraySettlement.sol` exposes single-proof settlement
+only.
+
+### Consequences
+
+- The contract surface stays small, which keeps the replay and authorisation
+  tests focused on what actually has to be right in v1.0.
+- The gas-saving measurement the spec wanted from batching will not appear in
+  `docs/BENCHMARKS.md` for v1.0. Per-settlement gas will, and that is the
+  baseline any future batching would be measured against.
+- UltraHonk proofs are individually large and verification is the dominant
+  cost, so batching would mean either an aggregation circuit or a loop over
+  verifications — the former is a substantial project, the latter saves only
+  the per-transaction overhead. Deferring avoids committing to that choice
+  under time pressure.
+- Reversible at a cost: adding `settleBatch` later is additive to the contract
+  rather than a rewrite, but it would need a redeploy.

@@ -2,9 +2,15 @@
 
 [![CI](https://github.com/JoshBlazer/dray/actions/workflows/ci.yml/badge.svg)](https://github.com/JoshBlazer/dray/actions/workflows/ci.yml)
 
-> **Status: in development, Phase 0 of 6.** Nothing below is claimed to work
+> **Status: in development, Phase 2 of 6.** Nothing below is claimed to work
 > unless `PROGRESS.md` records it as verified. See
 > [PROGRESS.md](PROGRESS.md) for what actually runs today.
+>
+> **Working now:** both circuits, their generated Solidity verifiers, and
+> settlement on a local chain — `make e2e-circuits` proves a Merkle membership
+> and a range proof and settles both on Anvil, rejecting replays.
+> **Not working yet:** the entire service tier. No API, no queue, no worker, no
+> relayer, and nothing on a public testnet.
 
 A distributed off-chain proof generation and relaying network: clients submit
 zero-knowledge circuit inputs over HTTP, a pool of Rust workers generates the
@@ -83,9 +89,23 @@ properly in `docs/DESIGN.md` in Phase 6.
 
 ## Benchmarks
 
-*(Phase 6, in `docs/BENCHMARKS.md`: proving time and peak memory per circuit,
-throughput at N workers, gas per settlement, and the saving from batching. Real
-measured numbers with methodology — none exist yet.)*
+Measured on 4 cores and 7.7 GB RAM — a deliberately modest box. Reproduce with
+`make prove`.
+
+| Circuit | Constraints | Prove | Peak RSS | Proof | On-chain verify |
+|---|---|---|---|---|---|
+| `membership` (tree depth 20) | 414 ACIR opcodes | 2.47 s | 42 MB | 8,384 B | ~3.01 M gas |
+| `range_proof` | 33 ACIR opcodes | 1.89 s | 40 MB | 8,384 B | ~3.01 M gas |
+
+Two things worth noting. Proving cost is dominated by the proof system rather
+than by circuit size — a 12× difference in constraints produces a 1.3×
+difference in proving time — so capacity planning cannot assume small circuits
+are cheap. And verification costs about 3 M gas regardless, which is what makes
+proof aggregation the interesting optimisation rather than transaction
+batching.
+
+Throughput at N workers lands in Phase 3; `docs/BENCHMARKS.md` arrives in
+Phase 6.
 
 ## Deployed addresses
 
@@ -115,8 +135,27 @@ make down     # stop dependencies
 make clean    # stop dependencies and drop their volumes
 ```
 
-Adding a circuit is documented in Phase 6, once the second circuit has proven
-the interface is genuinely circuit-agnostic.
+```bash
+make circuits       # compile the Noir circuits and run their tests
+make prove          # generate proofs and regenerate the Solidity verifiers
+make contracts      # forge build and forge test
+make e2e-circuits   # the whole path: input -> proof -> settled on Anvil
+```
+
+### Adding a circuit
+
+The settlement contract is circuit-agnostic, which imposes exactly one rule:
+**every circuit must declare `nullifier` as its first public input.**
+`DraySettlement` reads `publicInputs[0]` without knowing which circuit produced
+the proof, so a circuit that orders its public inputs differently would have
+some unrelated field treated as its nullifier. Use a distinct domain separator
+when deriving it, or a secret reused across circuits will collide in the shared
+nullifier set. See [ADR-003](DECISIONS.md).
+
+Then: add the package to `circuits/Nargo.toml`, add its name to the `CIRCUITS`
+array in `scripts/prove.sh` and `scripts/e2e-circuits.sh`, and register the
+generated verifier in `contracts/script/Deploy.s.sol`. No settlement contract
+change is required.
 
 ## Repository map
 
