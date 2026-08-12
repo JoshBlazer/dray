@@ -29,7 +29,7 @@ BB_BIN := $(HOME)/.bb
 FOUNDRY_BIN := $(FOUNDRY_DIR)/bin
 ZK_PATH := $(NARGO_BIN):$(BB_BIN):$(FOUNDRY_BIN)
 
-.PHONY: help setup setup-zk versions build test test-integration lint fmt up down clean seed api \
+.PHONY: help setup setup-zk versions build test test-integration reset-test-db lint fmt up down clean seed api \
         circuits contracts prove e2e-circuits e2e
 
 help: ## Show this help
@@ -93,16 +93,35 @@ clean: ## Stop dependencies and delete their volumes
 	$(COMPOSE) down -v
 
 DATABASE_URL ?= postgres://dray:dray@localhost:5432/dray
+TEST_DATABASE_URL ?= postgres://dray:dray@localhost:5432/dray_test
 
 seed: ## Register the circuits with their input schemas
-	psql "$(DATABASE_URL)" -f scripts/seed-circuits.sql
+	@# Falls back to the Postgres container when psql is not installed locally,
+	@# so the quickstart needs only Docker and Rust as advertised.
+	@if command -v psql >/dev/null 2>&1; then \
+		psql "$(DATABASE_URL)" -v ON_ERROR_STOP=1 -f scripts/seed-circuits.sql; \
+	else \
+		echo "psql not found locally; seeding through the postgres container"; \
+		$(COMPOSE) exec -T postgres psql -U dray -d dray -v ON_ERROR_STOP=1 \
+			< scripts/seed-circuits.sql; \
+	fi
 
 api: ## Run the ingest API against the local dependencies
 	DATABASE_URL="$(DATABASE_URL)" $(CARGO) run -p dray-api
 
 test-integration: ## Run the tests that need a live Postgres (requires make up)
-	DATABASE_URL="$(DATABASE_URL)" $(CARGO) test -p dray-store --features integration-tests
-	DATABASE_URL="$(DATABASE_URL)" $(CARGO) test -p dray-api --features integration-tests
+	@# A separate database, because the integration tests register a circuit per
+	@# test and would otherwise litter the development database with hundreds of
+	@# them — which is exactly what happened the first time this was run.
+	@$(COMPOSE) exec -T postgres psql -U dray -d dray -tAc \
+		"SELECT 1 FROM pg_database WHERE datname='dray_test'" | grep -q 1 || \
+		$(COMPOSE) exec -T postgres psql -U dray -d dray -c "CREATE DATABASE dray_test"
+	DATABASE_URL="$(TEST_DATABASE_URL)" $(CARGO) test -p dray-store --features integration-tests
+	DATABASE_URL="$(TEST_DATABASE_URL)" $(CARGO) test -p dray-api --features integration-tests
+
+reset-test-db: ## Drop and recreate the integration-test database
+	$(COMPOSE) exec -T postgres psql -U dray -d dray -c "DROP DATABASE IF EXISTS dray_test"
+	$(COMPOSE) exec -T postgres psql -U dray -d dray -c "CREATE DATABASE dray_test"
 
 circuits: ## Compile circuits and run their Noir tests
 	cd circuits && nargo compile && nargo test

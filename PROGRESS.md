@@ -43,10 +43,8 @@ And on CI, from a fresh clone, five jobs:
   Foundry suites, asserts the regenerated verifiers match what is committed,
   and finishes with the full Anvil end-to-end.
 
-**Caveat on `make up`.** The Compose stack is verified by CI on a fresh clone,
-but the `make up` target itself has never been executed on the author's
-workstation, because Docker is broken there (see below). The target is a
-one-line wrapper around the exact command CI runs. Flagged rather than glossed.
+`make up` has now been run locally as well: Postgres and Redis both reach
+healthy on the author's workstation, not only on CI.
 
 ### Phase 1 — the cryptographic path, end to end
 
@@ -101,9 +99,12 @@ Two guarantees live in the database rather than in application code: `job_state`
 is a real Postgres enum, and `jobs.job_hash` is `UNIQUE`. CI diffs the Postgres
 enums against the Rust ones, so drift fails the build.
 
-**Verified in CI, not locally.** Everything database-backed runs in the
-`Migrations and store integration` job. The author's workstation still has no
-Docker, so `make test-integration` has never been executed there.
+**Verified locally as well as in CI.** `make up`, `make seed`, and
+`make test-integration` all run on the author's workstation: 17 store and 14
+API integration tests against a real Postgres, plus a live end-to-end check —
+the API accepted a membership request, returned the same `job_id` with
+`created: false` on a byte-identical resubmission, and rejected a 19-sibling
+path with a 400 naming the field and the constraint.
 
 The toolchain is version-pinned per ADR-002, and `make setup-zk` has been run
 from scratch to confirm it installs exactly those versions rather than latest:
@@ -137,35 +138,6 @@ Relevant to Phase 3, when the worker takes over invoking these tools:
 
 ## What does not work yet
 
-- **Docker is unreachable from this WSL distro**, so `make up` has never been
-  run locally. An environment fault, not a project one — CI proves the Compose
-  stack comes up healthy from a fresh clone.
-
-  Diagnosis, corrected after a proper check: Docker Desktop **is** running and
-  healthy on the Windows host (Desktop 4.81.0, engine 29.6.1, confirmed by
-  invoking `docker.exe` from WSL). The problem is that **WSL integration is not
-  enabled for this distro** (`Ubuntu`). Specifically:
-
-  - `/var/run/docker.sock` exists but returns `ECONNREFUSED`, meaning nothing
-    is listening. A permissions problem would give `EACCES`, and the user is in
-    the `docker` group, so it is not that.
-  - The `desktop-linux` context targets `npipe:////./pipe/dockerDesktopLinuxEngine`,
-    a Windows named pipe that a Linux binary cannot open. The Unix socket is
-    the bridge Docker Desktop creates per *integrated* distro.
-  - `/mnt/wsl/docker-desktop/cli-tools` is mounted but empty; it is populated
-    for integrated distros.
-
-  Fix: Docker Desktop → Settings → Resources → WSL Integration → enable
-  `Ubuntu` → Apply & Restart.
-
-  Note also that `/usr/bin/docker` is currently Ubuntu's `docker.io` CLI and
-  `docker compose` reports "unknown command" — the v2 plugin is absent. Enabling
-  the integration supplies both the CLI and the compose plugin; failing that,
-  `sudo apt-get install -y docker-compose-v2`.
-
-  *An earlier revision of this file blamed a stale loopback mount left by a
-  shut-down Docker Desktop. That was wrong: it inferred the daemon's state from
-  a broken CLI symlink rather than testing the daemon.*
 - **The worker and relayer are still skeletons.** A component name, a doc
   comment, and one trivial test each. Nothing leases a job, nothing proves one,
   nothing submits one. A job accepted by the API today sits in `queued`
@@ -198,11 +170,20 @@ Relevant to Phase 3, when the worker takes over invoking these tools:
 
 ## Blocked on
 
-1. **Docker Desktop WSL integration for the `Ubuntu` distro** — a toggle in
-   Docker Desktop → Settings → Resources → WSL Integration. The daemon itself
-   is running and healthy; this distro is simply not wired to it. Blocks
-   Phase 3's chaos tests, which have to kill worker processes against a real
-   Postgres and Redis locally.
+*Nothing is currently blocked.*
+
+*Resolved 2026-08-12: Docker. Two false diagnoses preceded the real one. The
+daemon was never down: `docker.io` was installed and `dockerd` was running and
+healthy the whole time. Docker Desktop's WSL integration — which **was**
+enabled — replaced the systemd-created `/run/docker.sock` ten minutes after
+`dockerd` bound it, leaving a socket file nothing listened on while `dockerd`
+kept the now-unreachable original. Hence `ECONNREFUSED` rather than `EACCES`,
+and hence a healthy daemon that no client could reach. `systemctl restart
+docker.socket docker.service` rebound the path. Separately, a dead Desktop
+symlink at `/usr/local/lib/docker/cli-plugins/docker-compose` shadowed the real
+plugin — that search path is consulted before `/usr/libexec` — which is why
+`docker compose` reported "unknown command" while the plugin binary ran fine on
+its own. Fixed with a user-level symlink in `~/.docker/cli-plugins`.*
 
 *Resolved 2026-08-12: the GitHub remote — <https://github.com/JoshBlazer/dray>,
 pushed, CI green on the first run.*
@@ -269,6 +250,5 @@ Two things carried forward from earlier phases that Phase 3 depends on:
   those numbers rather than guessed, with enough headroom that a normal proof
   never trips them.
 
-**Docker is required for this phase.** The chaos and contention tests need a
-real Postgres and Redis locally; CI alone cannot substitute, because killing
-worker processes mid-proof is the point of the exercise.
+Docker now works locally, so Phase 3's chaos and contention tests have
+somewhere to run. That was the last environmental blocker.

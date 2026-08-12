@@ -6,11 +6,12 @@
 > unless `PROGRESS.md` records it as verified. See
 > [PROGRESS.md](PROGRESS.md) for what actually runs today.
 >
-> **Working now:** both circuits, their generated Solidity verifiers, and
-> settlement on a local chain — `make e2e-circuits` proves a Merkle membership
-> and a range proof and settles both on Anvil, rejecting replays.
-> **Not working yet:** the entire service tier. No API, no queue, no worker, no
-> relayer, and nothing on a public testnet.
+> **Working now:** both circuits and their generated Solidity verifiers, with
+> settlement on a local chain (`make e2e-circuits`); and the ingest API with a
+> durable, deduplicating job store.
+> **Not working yet:** nothing consumes the queue. There is no worker and no
+> relayer, so an accepted job stays `queued`, and nothing has touched a public
+> testnet.
 
 A distributed off-chain proof generation and relaying network: clients submit
 zero-knowledge circuit inputs over HTTP, a pool of Rust workers generates the
@@ -26,8 +27,9 @@ that is also a single point of failure. Dray is the third option — a durable,
 horizontally scalable proving tier with at-least-once delivery and on-chain
 settlement.
 
-*(Concrete measured numbers replace this paragraph's hand-waving in Phase 1,
-once proving time and peak memory are recorded for both circuits.)*
+Concretely: a Merkle membership proof over a depth-20 tree takes **2.5 seconds
+and 42 MB** on a four-core machine — and that is native code, with none of the
+overhead a browser would add. Multiply by every user on every action.
 
 ## Architecture
 
@@ -47,10 +49,31 @@ on Debian or Ubuntu).
 
 ```bash
 git clone https://github.com/JoshBlazer/dray && cd dray
-make setup    # verify prerequisites, install rustfmt and clippy
-make up       # start Postgres and Redis, wait for healthy
-make test     # run the suite
+make setup            # verify prerequisites, install rustfmt and clippy
+make up               # start Postgres and Redis, wait for healthy
+make seed             # register the circuits and their input schemas
+make test             # unit and property tests, no database needed
+make test-integration # tests that need the live Postgres
+make api              # run the ingest API on :8080
 ```
+
+Then submit a proof request:
+
+```bash
+curl -X POST localhost:8080/v1/proofs -H 'content-type: application/json' -d '{
+  "circuit_id": "membership",
+  "inputs": {"secret": "42", "leaf_index": "5",
+             "siblings": ["7","7","7","7","7","7","7","7","7","7",
+                          "7","7","7","7","7","7","7","7","7","7"]}
+}'
+```
+
+It returns `202` with a job id. Submit it twice and the second response carries
+the same id with `"created": false` — the job is identified by the hash of its
+canonical inputs, so a retry after a timeout cannot create duplicate work.
+
+**Nothing proves that job yet.** The worker pool is Phase 3; today an accepted
+job stays `queued`.
 
 For the circuits and contracts, `make setup-zk` installs the proving toolchain
 at the exact pinned versions below; `make versions` reports what you have
@@ -128,12 +151,16 @@ a general-purpose blockchain indexer.
 ## Development
 
 ```bash
-make build    # build the workspace
-make test     # unit and integration tests
-make lint     # cargo fmt --check and clippy -D warnings
-make down     # stop dependencies
-make clean    # stop dependencies and drop their volumes
+make build            # build the workspace
+make test             # unit and property tests
+make test-integration # tests needing a live Postgres
+make lint             # cargo fmt --check and clippy -D warnings
+make down             # stop dependencies
+make clean            # stop dependencies and drop their volumes
 ```
+
+The integration tests use a separate `dray_test` database, so running them does
+not litter your development data. `make reset-test-db` drops and recreates it.
 
 ```bash
 make circuits       # compile the Noir circuits and run their tests
