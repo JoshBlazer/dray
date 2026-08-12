@@ -423,7 +423,10 @@ impl Store {
     /// # Errors
     ///
     /// Propagates database failures.
-    pub async fn transitions(&self, id: Uuid) -> Result<Vec<(JobState, JobEvent, JobState)>, StoreError> {
+    pub async fn transitions(
+        &self,
+        id: Uuid,
+    ) -> Result<Vec<(JobState, JobEvent, JobState)>, StoreError> {
         let rows = sqlx::query(
             "SELECT from_state::text AS f, event::text AS e, to_state::text AS t
              FROM job_transitions WHERE job_id = $1 ORDER BY occurred_at, id",

@@ -28,8 +28,7 @@ use serde_json::json;
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL must be set to run the integration tests")
+    std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run the integration tests")
 }
 
 async fn store() -> Store {
@@ -89,7 +88,10 @@ async fn resubmitting_identical_inputs_returns_the_same_job() {
 
     assert_eq!(a, Enqueued::Created);
     assert_eq!(b, Enqueued::Duplicate);
-    assert_eq!(first.id, second.id, "a duplicate must not create a second job");
+    assert_eq!(
+        first.id, second.id,
+        "a duplicate must not create a second job"
+    );
 }
 
 /// Key order is not semantic in JSON, so these are the same request. If
@@ -118,8 +120,14 @@ async fn different_inputs_create_different_jobs() {
     let store = store().await;
     let circuit = fresh_circuit(&store).await;
 
-    let (a, _) = store.enqueue(&circuit, &json!({"v": "1"}), None, 3).await.unwrap();
-    let (b, outcome) = store.enqueue(&circuit, &json!({"v": "2"}), None, 3).await.unwrap();
+    let (a, _) = store
+        .enqueue(&circuit, &json!({"v": "1"}), None, 3)
+        .await
+        .unwrap();
+    let (b, outcome) = store
+        .enqueue(&circuit, &json!({"v": "2"}), None, 3)
+        .await
+        .unwrap();
 
     assert_eq!(outcome, Enqueued::Created);
     assert_ne!(a.id, b.id);
@@ -159,11 +167,17 @@ async fn fifty_concurrent_identical_submissions_create_one_job() {
     }
 
     assert_eq!(ids.len(), 50, "every submission should have got an answer");
-    assert_eq!(created, 1, "exactly one submission should have created the job");
+    assert_eq!(
+        created, 1,
+        "exactly one submission should have created the job"
+    );
     assert_eq!(duplicates, 49);
 
     let first = ids[0];
-    assert!(ids.iter().all(|&id| id == first), "all callers must get the same job");
+    assert!(
+        ids.iter().all(|&id| id == first),
+        "all callers must get the same job"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -188,7 +202,11 @@ async fn jobs_survive_a_reconnect() {
     }
 
     let reconnected = store().await;
-    let found = reconnected.job(job_id).await.unwrap().expect("job vanished");
+    let found = reconnected
+        .job(job_id)
+        .await
+        .unwrap()
+        .expect("job vanished");
 
     assert_eq!(found.id, job_id);
     assert_eq!(found.state, JobState::Queued);
@@ -204,7 +222,11 @@ async fn a_job_can_be_found_by_its_content_hash() {
     let (job, _) = store.enqueue(&circuit, &inputs, None, 3).await.unwrap();
     let hash = dray_core::job_hash(&circuit, &inputs).unwrap();
 
-    let found = store.job_by_hash(&hash).await.unwrap().expect("not found by hash");
+    let found = store
+        .job_by_hash(&hash)
+        .await
+        .unwrap()
+        .expect("not found by hash");
     assert_eq!(found.id, job.id);
 }
 
@@ -216,13 +238,19 @@ async fn a_job_can_be_found_by_its_content_hash() {
 async fn the_happy_path_walks_the_state_machine() {
     let store = store().await;
     let circuit = fresh_circuit(&store).await;
-    let (job, _) = store.enqueue(&circuit, &json!({"walk": 1}), None, 3).await.unwrap();
+    let (job, _) = store
+        .enqueue(&circuit, &json!({"walk": 1}), None, 3)
+        .await
+        .unwrap();
 
     for (event, expected) in [
         (JobEvent::Leased, JobState::Leased),
         (JobEvent::ProvingStarted, JobState::Proving),
     ] {
-        let updated = store.apply_event(job.id, event, Some("worker-1"), None).await.unwrap();
+        let updated = store
+            .apply_event(job.id, event, Some("worker-1"), None)
+            .await
+            .unwrap();
         assert_eq!(updated.state, expected, "after {event}");
     }
 }
@@ -231,14 +259,23 @@ async fn the_happy_path_walks_the_state_machine() {
 async fn an_illegal_transition_is_rejected_and_changes_nothing() {
     let store = store().await;
     let circuit = fresh_circuit(&store).await;
-    let (job, _) = store.enqueue(&circuit, &json!({"illegal": 1}), None, 3).await.unwrap();
+    let (job, _) = store
+        .enqueue(&circuit, &json!({"illegal": 1}), None, 3)
+        .await
+        .unwrap();
 
     // A queued job has not been proved, so it cannot be submitted.
-    let result = store.apply_event(job.id, JobEvent::SubmissionStarted, None, None).await;
+    let result = store
+        .apply_event(job.id, JobEvent::SubmissionStarted, None, None)
+        .await;
     assert!(matches!(result, Err(StoreError::IllegalTransition(_))));
 
     let unchanged = store.job(job.id).await.unwrap().unwrap();
-    assert_eq!(unchanged.state, JobState::Queued, "rejected event must not mutate state");
+    assert_eq!(
+        unchanged.state,
+        JobState::Queued,
+        "rejected event must not mutate state"
+    );
 }
 
 /// A worker dying must not leave its name on a job that has returned to the
@@ -248,28 +285,51 @@ async fn an_illegal_transition_is_rejected_and_changes_nothing() {
 async fn losing_a_lease_clears_the_lease_holder() {
     let store = store().await;
     let circuit = fresh_circuit(&store).await;
-    let (job, _) = store.enqueue(&circuit, &json!({"lease": 1}), None, 3).await.unwrap();
+    let (job, _) = store
+        .enqueue(&circuit, &json!({"lease": 1}), None, 3)
+        .await
+        .unwrap();
 
-    store.apply_event(job.id, JobEvent::Leased, Some("worker-1"), None).await.unwrap();
+    store
+        .apply_event(job.id, JobEvent::Leased, Some("worker-1"), None)
+        .await
+        .unwrap();
     let expired = store
         .apply_event(job.id, JobEvent::LeaseExpired, Some("reaper"), None)
         .await
         .unwrap();
 
     assert_eq!(expired.state, JobState::Queued);
-    assert_eq!(expired.leased_by, None, "lease holder should have been cleared");
+    assert_eq!(
+        expired.leased_by, None,
+        "lease holder should have been cleared"
+    );
 }
 
 #[tokio::test]
 async fn transitions_are_recorded_for_audit() {
     let store = store().await;
     let circuit = fresh_circuit(&store).await;
-    let (job, _) = store.enqueue(&circuit, &json!({"audit": 1}), None, 3).await.unwrap();
+    let (job, _) = store
+        .enqueue(&circuit, &json!({"audit": 1}), None, 3)
+        .await
+        .unwrap();
 
-    store.apply_event(job.id, JobEvent::Leased, Some("w"), None).await.unwrap();
-    store.apply_event(job.id, JobEvent::ProvingStarted, Some("w"), None).await.unwrap();
     store
-        .apply_event(job.id, JobEvent::LeaseExpired, Some("reaper"), Some("worker died"))
+        .apply_event(job.id, JobEvent::Leased, Some("w"), None)
+        .await
+        .unwrap();
+    store
+        .apply_event(job.id, JobEvent::ProvingStarted, Some("w"), None)
+        .await
+        .unwrap();
+    store
+        .apply_event(
+            job.id,
+            JobEvent::LeaseExpired,
+            Some("reaper"),
+            Some("worker died"),
+        )
         .await
         .unwrap();
 
@@ -278,7 +338,11 @@ async fn transitions_are_recorded_for_audit() {
         history,
         vec![
             (JobState::Queued, JobEvent::Leased, JobState::Leased),
-            (JobState::Leased, JobEvent::ProvingStarted, JobState::Proving),
+            (
+                JobState::Leased,
+                JobEvent::ProvingStarted,
+                JobState::Proving
+            ),
             (JobState::Proving, JobEvent::LeaseExpired, JobState::Queued),
         ]
     );
@@ -291,14 +355,24 @@ async fn transitions_are_recorded_for_audit() {
 async fn concurrent_transitions_on_one_job_serialise() {
     let store = store().await;
     let circuit = fresh_circuit(&store).await;
-    let (job, _) = store.enqueue(&circuit, &json!({"race": 1}), None, 3).await.unwrap();
+    let (job, _) = store
+        .enqueue(&circuit, &json!({"race": 1}), None, 3)
+        .await
+        .unwrap();
 
     let mut tasks = tokio::task::JoinSet::new();
     for worker in 0..8 {
         let store = store.clone();
         let id = job.id;
         tasks.spawn(async move {
-            store.apply_event(id, JobEvent::Leased, Some(&format!("worker-{worker}")), None).await
+            store
+                .apply_event(
+                    id,
+                    JobEvent::Leased,
+                    Some(&format!("worker-{worker}")),
+                    None,
+                )
+                .await
         });
     }
 
@@ -310,7 +384,10 @@ async fn concurrent_transitions_on_one_job_serialise() {
     }
 
     assert_eq!(winners, 1, "exactly one worker should have won the lease");
-    assert_eq!(store.job(job.id).await.unwrap().unwrap().state, JobState::Leased);
+    assert_eq!(
+        store.job(job.id).await.unwrap().unwrap().state,
+        JobState::Leased
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -355,7 +432,9 @@ async fn float_inputs_are_refused() {
     let store = store().await;
     let circuit = fresh_circuit(&store).await;
 
-    let result = store.enqueue(&circuit, &json!({"value": 1.5}), None, 3).await;
+    let result = store
+        .enqueue(&circuit, &json!({"value": 1.5}), None, 3)
+        .await;
     assert!(matches!(result, Err(StoreError::Canonical(_))));
 }
 
@@ -365,7 +444,10 @@ async fn float_inputs_are_refused() {
 async fn the_database_refuses_a_proved_job_without_a_proof() {
     let store = store().await;
     let circuit = fresh_circuit(&store).await;
-    let (job, _) = store.enqueue(&circuit, &json!({"constraint": 1}), None, 3).await.unwrap();
+    let (job, _) = store
+        .enqueue(&circuit, &json!({"constraint": 1}), None, 3)
+        .await
+        .unwrap();
 
     let result = sqlx::query("UPDATE jobs SET state = 'proved' WHERE id = $1")
         .bind(job.id)
@@ -381,7 +463,10 @@ async fn queue_depth_counts_queued_jobs() {
     let circuit = fresh_circuit(&store).await;
 
     let before = store.queue_depth().await.unwrap();
-    store.enqueue(&circuit, &json!({"depth": 1}), None, 3).await.unwrap();
+    store
+        .enqueue(&circuit, &json!({"depth": 1}), None, 3)
+        .await
+        .unwrap();
     let after = store.queue_depth().await.unwrap();
 
     assert!(after > before, "queue depth should have grown");
