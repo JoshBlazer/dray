@@ -32,6 +32,17 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations"
 /// Name of this component, as it appears in logs, metrics, and traces.
 pub const COMPONENT: &str = "dray-store";
 
+/// The columns [`Job`] is built from.
+///
+/// Spelled out rather than `SELECT *` for two reasons. `state` is a Postgres
+/// enum and has to be cast to text explicitly — sqlx will not decode a
+/// `job_state` into a `String`, and `SELECT *` gives no opportunity to say so.
+/// And an explicit list means adding a column to the table cannot silently
+/// change what this code reads.
+const JOB_COLUMNS: &str = "id, circuit_id, job_hash, idempotency_key, inputs, \
+     state::text AS state, attempts, max_attempts, last_error, leased_by, proof, \
+     created_at, updated_at";
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("database error: {0}")]
@@ -252,19 +263,20 @@ impl Store {
 
         let hash = dray_core::job_hash(circuit_id, inputs)?;
 
-        let inserted = sqlx::query(
+        let insert = format!(
             "INSERT INTO jobs (circuit_id, job_hash, idempotency_key, inputs, max_attempts)
              VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (job_hash) DO NOTHING
-             RETURNING *",
-        )
-        .bind(circuit_id)
-        .bind(hash.as_slice())
-        .bind(idempotency_key)
-        .bind(inputs)
-        .bind(max_attempts)
-        .fetch_optional(&self.pool)
-        .await?;
+             RETURNING {JOB_COLUMNS}"
+        );
+        let inserted = sqlx::query(&insert)
+            .bind(circuit_id)
+            .bind(hash.as_slice())
+            .bind(idempotency_key)
+            .bind(inputs)
+            .bind(max_attempts)
+            .fetch_optional(&self.pool)
+            .await?;
 
         if let Some(row) = inserted {
             return Ok((Job::from_row(&row)?, Enqueued::Created));
@@ -272,7 +284,8 @@ impl Store {
 
         // Lost the race, or a genuine repeat submission. Either way the correct
         // answer is the job that already exists.
-        let existing = sqlx::query("SELECT * FROM jobs WHERE job_hash = $1")
+        let select = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE job_hash = $1");
+        let existing = sqlx::query(&select)
             .bind(hash.as_slice())
             .fetch_one(&self.pool)
             .await?;
@@ -286,7 +299,8 @@ impl Store {
     ///
     /// Propagates database failures.
     pub async fn job(&self, id: Uuid) -> Result<Option<Job>, StoreError> {
-        let row = sqlx::query("SELECT * FROM jobs WHERE id = $1")
+        let sql = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = $1");
+        let row = sqlx::query(&sql)
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -299,7 +313,8 @@ impl Store {
     ///
     /// Propagates database failures.
     pub async fn job_by_hash(&self, hash: &[u8]) -> Result<Option<Job>, StoreError> {
-        let row = sqlx::query("SELECT * FROM jobs WHERE job_hash = $1")
+        let sql = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE job_hash = $1");
+        let row = sqlx::query(&sql)
             .bind(hash)
             .fetch_optional(&self.pool)
             .await?;
@@ -339,7 +354,8 @@ impl Store {
         actor: Option<&str>,
         detail: Option<&str>,
     ) -> Result<Job, StoreError> {
-        let current = sqlx::query("SELECT * FROM jobs WHERE id = $1 FOR UPDATE")
+        let lock = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = $1 FOR UPDATE");
+        let current = sqlx::query(&lock)
             .bind(id)
             .fetch_optional(&mut **tx)
             .await?
@@ -353,21 +369,22 @@ impl Store {
         // gone back to the queue.
         let keeps_lease = next.is_in_flight();
 
-        let updated = sqlx::query(
+        let update = format!(
             "UPDATE jobs SET
                  state            = $2::job_state,
-                 leased_by        = CASE WHEN $3 THEN leased_by ELSE NULL END,
-                 lease_expires_at = CASE WHEN $3 THEN lease_expires_at ELSE NULL END,
-                 last_error       = COALESCE($4, last_error)
+                 leased_by        = CASE WHEN $3::boolean THEN leased_by ELSE NULL END,
+                 lease_expires_at = CASE WHEN $3::boolean THEN lease_expires_at ELSE NULL END,
+                 last_error       = COALESCE($4::text, last_error)
              WHERE id = $1
-             RETURNING *",
-        )
-        .bind(id)
-        .bind(next.as_str())
-        .bind(keeps_lease)
-        .bind(detail)
-        .fetch_one(&mut **tx)
-        .await?;
+             RETURNING {JOB_COLUMNS}"
+        );
+        let updated = sqlx::query(&update)
+            .bind(id)
+            .bind(next.as_str())
+            .bind(keeps_lease)
+            .bind(detail)
+            .fetch_one(&mut **tx)
+            .await?;
 
         sqlx::query(
             "INSERT INTO job_transitions (job_id, from_state, event, to_state, actor, detail)
