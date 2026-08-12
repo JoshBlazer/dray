@@ -41,8 +41,8 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-targets --locked
 
-  migrations:
-    name: Migrations apply cleanly
+  database:
+    name: Migrations and store integration
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -94,6 +94,25 @@ jobs:
             | sort > /tmp/rust_events.txt
           diff /tmp/pg_events.txt /tmp/rust_events.txt \
             || { echo "job_event enum drift between Postgres and Rust"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # A second, empty database. The steps above proved the raw SQL applies
+      # under psql; the integration tests apply the same migrations through
+      # sqlx's migrator instead, which is the path the services actually use on
+      # start. Both are worth exercising, and they cannot share a database
+      # because the second would find the schema already there.
+      - name: Create a database for the integration tests
+        run: $PSQL -c "CREATE DATABASE dray_test;"
+
+      # These are the tests that cannot run without a real database:
+      # concurrent deduplication, transition serialisation, and the schema's
+      # own check constraints. A required job, not an optional one.
+      - name: Store integration tests
+        env:
+          DATABASE_URL: postgres://dray:dray@localhost:5432/dray_test
+        run: cargo test -p dray-store --features integration-tests
 
   circuits:
     name: Circuits and contracts

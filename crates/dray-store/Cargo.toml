@@ -8,7 +8,23 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+chrono = "0.4.45"
 dray-core.workspace = true
+serde_json = "1.0.151"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }
+thiserror = "2.0.20"
+tracing = "0.1.44"
+uuid = { version = "1.24.0", features = ["v4", "serde"] }
+
+[features]
+# Tests that need a live PostgreSQL. Off by default so `cargo test` on a fresh
+# clone passes without Docker, and enabled explicitly in CI — rather than
+# skipping at runtime when DATABASE_URL is unset, which would let a broken
+# query masquerade as a green build.
+integration-tests = []
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
