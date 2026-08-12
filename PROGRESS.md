@@ -137,14 +137,35 @@ Relevant to Phase 3, when the worker takes over invoking these tools:
 
 ## What does not work yet
 
-- **Docker is unavailable on the author's workstation**, so `make up` has never
-  been run there. This is an environment fault, not a project one — CI proves
-  the Compose stack comes up healthy from a fresh clone. Diagnosis:
-  `/mnt/wsl/docker-desktop/cli-tools` is a read-only loopback ISO mount
-  (`/dev/loop0`) that is empty, so `/usr/bin/docker` — a symlink into it —
-  returns an I/O error. Restarting Docker Desktop did not clear it. The fix
-  chosen is to install Docker natively inside WSL rather than depend on
-  Desktop's integration; systemd is PID 1 here, so it will run as a service.
+- **Docker is unreachable from this WSL distro**, so `make up` has never been
+  run locally. An environment fault, not a project one — CI proves the Compose
+  stack comes up healthy from a fresh clone.
+
+  Diagnosis, corrected after a proper check: Docker Desktop **is** running and
+  healthy on the Windows host (Desktop 4.81.0, engine 29.6.1, confirmed by
+  invoking `docker.exe` from WSL). The problem is that **WSL integration is not
+  enabled for this distro** (`Ubuntu`). Specifically:
+
+  - `/var/run/docker.sock` exists but returns `ECONNREFUSED`, meaning nothing
+    is listening. A permissions problem would give `EACCES`, and the user is in
+    the `docker` group, so it is not that.
+  - The `desktop-linux` context targets `npipe:////./pipe/dockerDesktopLinuxEngine`,
+    a Windows named pipe that a Linux binary cannot open. The Unix socket is
+    the bridge Docker Desktop creates per *integrated* distro.
+  - `/mnt/wsl/docker-desktop/cli-tools` is mounted but empty; it is populated
+    for integrated distros.
+
+  Fix: Docker Desktop → Settings → Resources → WSL Integration → enable
+  `Ubuntu` → Apply & Restart.
+
+  Note also that `/usr/bin/docker` is currently Ubuntu's `docker.io` CLI and
+  `docker compose` reports "unknown command" — the v2 plugin is absent. Enabling
+  the integration supplies both the CLI and the compose plugin; failing that,
+  `sudo apt-get install -y docker-compose-v2`.
+
+  *An earlier revision of this file blamed a stale loopback mount left by a
+  shut-down Docker Desktop. That was wrong: it inferred the daemon's state from
+  a broken CLI symlink rather than testing the daemon.*
 - **The worker and relayer are still skeletons.** A component name, a doc
   comment, and one trivial test each. Nothing leases a job, nothing proves one,
   nothing submits one. A job accepted by the API today sits in `queued`
@@ -177,11 +198,11 @@ Relevant to Phase 3, when the worker takes over invoking these tools:
 
 ## Blocked on
 
-1. **Docker on the author's workstation** — needs
-   `sudo apt-get install -y docker.io docker-compose-v2 && sudo systemctl
-   enable --now docker`. Not blocking Phase 0, which CI closed out, but it will
-   block Phase 3's chaos tests and Phase 4's Anvil integration tests, which
-   have to run locally.
+1. **Docker Desktop WSL integration for the `Ubuntu` distro** — a toggle in
+   Docker Desktop → Settings → Resources → WSL Integration. The daemon itself
+   is running and healthy; this distro is simply not wired to it. Blocks
+   Phase 3's chaos tests, which have to kill worker processes against a real
+   Postgres and Redis locally.
 
 *Resolved 2026-08-12: the GitHub remote — <https://github.com/JoshBlazer/dray>,
 pushed, CI green on the first run.*
