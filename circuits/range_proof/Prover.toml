@@ -3,12 +3,12 @@
 # Proves that a private value of 42 lies within the public range [18, 150],
 # using secret = 12345.
 #
-# `nullifier` is a Pedersen hash over (secret, value, domain) and was produced
-# by the circuit itself:
+# The nullifier is not listed because it is not an input — the circuit returns
+# it, and it appears as the last public input of the resulting proof (ADR-008).
+# Its expected value is printed by:
 #
 #   nargo test --show-output print_reference_witness
 
-nullifier = "0x2df5db123edce847869340551204d5b3d6c18588b8a904e6a803c43c694cd01c"
 min = "18"
 max = "150"
 

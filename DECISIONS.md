@@ -105,7 +105,7 @@ rather than latest, and are stated in the README's prerequisites.
 ## ADR-003 — Nullifier is public input 0 for every circuit
 
 **Date:** 2026-08-12
-**Status:** accepted
+**Status:** superseded by [ADR-008](#adr-008--nullifier-is-the-last-public-input-and-is-returned-not-supplied)
 
 ### Context
 
@@ -290,3 +290,92 @@ over a large body.
 - The schemas are currently registered by whatever seeds the database. Keeping
   them in step with the circuits themselves is not yet automated, and that gap
   is recorded in `PROGRESS.md`.
+
+---
+
+## ADR-008 — Nullifier is the last public input, and is returned, not supplied
+
+**Date:** 2026-08-17
+**Status:** accepted, supersedes ADR-003
+
+### Context
+
+ADR-003 required every circuit to declare `nullifier` as its first public
+input, and `DraySettlement.sol` read `publicInputs[0]`. That held for Phases 1
+and 2 because nothing ever had to *construct* a witness — the reference
+`Prover.toml` files were committed by hand, with the nullifier value copied out
+of a test that printed it.
+
+Phase 3 broke that assumption immediately. The worker builds `Prover.toml` from
+the job inputs a client submitted, and a nullifier is a Pedersen hash over
+private data. Supplying it as an input means somebody has to compute that hash
+before the proof exists:
+
+- **The client cannot.** Computing it means running Noir, or reimplementing
+  Pedersen over BN254 against the exact domain separator the circuit uses. The
+  entire premise of Dray is that a client submits inputs and gets a proof back
+  without operating a proving stack. Requiring one to *place an order* is
+  self-defeating.
+- **The worker should not.** It could reimplement Pedersen in Rust, but then
+  two independent implementations would have to agree exactly, forever. Any
+  divergence surfaces as `nullifier mismatch` after a full proving attempt has
+  already been paid for — the most expensive place to discover a bug.
+
+The layout was also concealing a second defect: the registered input schema for
+`membership` omitted `root`, so no submittable job could ever have produced a
+solvable witness. Nothing caught it, because no code path had yet tried.
+
+### Decision
+
+Every Dray circuit **returns** its nullifier rather than accepting it, and the
+settlement contract reads it from the **last** public input.
+
+```noir
+fn main(root: pub Field, secret: Field, ...) -> pub Field {
+    assert(compute_merkle_root(...) == root, "merkle root mismatch");
+    derive_nullifier(secret)
+}
+```
+
+Noir orders the public input vector as declared public parameters first, then
+the return value, so the nullifier lands at the end. Verified against real
+proofs rather than assumed: `membership` publishes `(root, nullifier)` and
+`range_proof` publishes `(min, max, nullifier)`, 2 and 3 field elements
+respectively.
+
+That the two lengths differ is what makes the convention meaningful. "Last" is
+the only position two circuits with different public-input counts can share; a
+fixed index only ever worked because the nullifier sat before the part that
+varies.
+
+Domain separation is unchanged. Each circuit still derives its nullifier under
+its own separator, so the shared nullifier set cannot let one circuit block
+another.
+
+### Consequences
+
+- A client submits only what it actually knows: its secret, its position, its
+  authentication path, and the public root it is proving against. No hashing
+  required, and no proving stack.
+- The worker writes `Prover.toml` directly from validated job inputs, with no
+  derivation step and no second Pedersen implementation to keep in sync.
+- A forged nullifier is now impossible by construction rather than by an
+  assertion. There is no input to lie about; the circuit computes it.
+- The contract reads `publicInputs[publicInputs.length - 1]`. The empty-vector
+  check that already existed is now load-bearing rather than defensive, since
+  it is what stops the subtraction underflowing.
+- Circuit tests that asserted `nullifier mismatch` had nothing left to reject,
+  so they were replaced by tests of the property that actually matters now:
+  that the *published* nullifier is bound to the witness — same secret gives
+  the same nullifier from any tree position, different values under one secret
+  give different nullifiers, and the declared range does not perturb it.
+- Verification keys changed, so both Solidity verifiers were regenerated. The
+  CI job that diffs regenerated verifiers against the committed ones is what
+  keeps that from drifting.
+- `membership`'s registered schema gained the `root` it was missing.
+- Cost: the circuits, the contract, both scripts and 25 contract tests had to
+  change, mid-Phase-3, to fix a convention two phases old. It was worth it —
+  the alternative was a proving tier that could not construct a witness — but
+  it is the clearest evidence so far for building the thin end-to-end slice
+  early. A single job proved through the real worker in Phase 1 would have
+  caught this before anything was built on top of it.

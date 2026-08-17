@@ -38,6 +38,14 @@ contract DraySettlementTest is Test {
     bytes internal rangeProofProof;
     bytes32[] internal rangeProofInputs;
 
+    /// @dev The nullifier is the last public input, whatever the circuit's
+    /// shape (ADR-008). Reading it through this helper rather than a literal
+    /// index is what lets the same assertions cover both circuits, which have
+    /// different numbers of public inputs.
+    function _nullifierOf(bytes32[] memory publicInputs) internal pure returns (bytes32) {
+        return publicInputs[publicInputs.length - 1];
+    }
+
     function setUp() public {
         membershipProof = _readProof("membership");
         membershipInputs = _readPublicInputs("membership");
@@ -63,14 +71,18 @@ contract DraySettlementTest is Test {
         vm.prank(RELAYER);
         settlement.settle(MEMBERSHIP, membershipProof, membershipInputs);
 
-        assertTrue(settlement.nullifierUsed(membershipInputs[0]), "nullifier not consumed");
+        assertTrue(
+            settlement.nullifierUsed(_nullifierOf(membershipInputs)), "nullifier not consumed"
+        );
     }
 
     function test_valid_range_proof_settles() public {
         vm.prank(RELAYER);
         settlement.settle(RANGE_PROOF, rangeProofProof, rangeProofInputs);
 
-        assertTrue(settlement.nullifierUsed(rangeProofInputs[0]), "nullifier not consumed");
+        assertTrue(
+            settlement.nullifierUsed(_nullifierOf(rangeProofInputs)), "nullifier not consumed"
+        );
     }
 
     /// @dev The point of having two circuits: one contract, no circuit-specific
@@ -81,32 +93,42 @@ contract DraySettlementTest is Test {
         settlement.settle(RANGE_PROOF, rangeProofProof, rangeProofInputs);
         vm.stopPrank();
 
-        assertTrue(settlement.nullifierUsed(membershipInputs[0]));
-        assertTrue(settlement.nullifierUsed(rangeProofInputs[0]));
+        assertTrue(settlement.nullifierUsed(_nullifierOf(membershipInputs)));
+        assertTrue(settlement.nullifierUsed(_nullifierOf(rangeProofInputs)));
     }
 
     function test_settlement_emits_the_event() public {
         vm.expectEmit(true, true, true, true);
-        emit DraySettlement.Settled(MEMBERSHIP, membershipInputs[0], RELAYER, membershipInputs);
+        emit DraySettlement.Settled(
+            MEMBERSHIP, _nullifierOf(membershipInputs), RELAYER, membershipInputs
+        );
 
         vm.prank(RELAYER);
         settlement.settle(MEMBERSHIP, membershipProof, membershipInputs);
     }
 
-    /// @dev Confirms the ADR-003 convention actually holds in the artefacts,
+    /// @dev Confirms the ADR-008 convention actually holds in the artefacts,
     /// rather than only in the documentation. Membership publishes
-    /// (nullifier, root); the range proof publishes (nullifier, min, max).
-    function test_public_input_layout_matches_adr_003() public view {
+    /// (root, nullifier); the range proof publishes (min, max, nullifier).
+    ///
+    /// The differing lengths are the point. If both circuits published the same
+    /// number of public inputs, a fixed index would work by accident and this
+    /// suite would not notice when it stopped working.
+    function test_public_input_layout_matches_adr_008() public view {
         assertEq(membershipInputs.length, 2, "membership should publish 2 inputs");
         assertEq(rangeProofInputs.length, 3, "range_proof should publish 3 inputs");
 
-        // min = 18, max = 150 from the committed Prover.toml.
-        assertEq(uint256(rangeProofInputs[1]), 18, "min is not public input 1");
-        assertEq(uint256(rangeProofInputs[2]), 150, "max is not public input 2");
+        // min = 18, max = 150 from the committed Prover.toml, declared before
+        // the returned nullifier.
+        assertEq(uint256(rangeProofInputs[0]), 18, "min is not public input 0");
+        assertEq(uint256(rangeProofInputs[1]), 150, "max is not public input 1");
 
         // Distinct domain separators must give distinct nullifiers, or the
         // shared nullifier set would let one circuit block the other.
-        assertTrue(membershipInputs[0] != rangeProofInputs[0], "nullifiers collide across circuits");
+        assertTrue(
+            _nullifierOf(membershipInputs) != _nullifierOf(rangeProofInputs),
+            "nullifiers collide across circuits"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -119,7 +141,7 @@ contract DraySettlementTest is Test {
 
         vm.expectRevert(
             abi.encodeWithSelector(
-                DraySettlement.NullifierAlreadyUsed.selector, membershipInputs[0]
+                DraySettlement.NullifierAlreadyUsed.selector, _nullifierOf(membershipInputs)
             )
         );
         settlement.settle(MEMBERSHIP, membershipProof, membershipInputs);
@@ -199,6 +221,8 @@ contract DraySettlementTest is Test {
         bytes32[] memory tooMany = new bytes32[](3);
         tooMany[0] = membershipInputs[0];
         tooMany[1] = membershipInputs[1];
+        // A third entry also moves where the nullifier is read from, so this
+        // covers the length check and the convention at once.
         tooMany[2] = bytes32(uint256(1));
 
         vm.prank(RELAYER);
@@ -272,7 +296,8 @@ contract DraySettlementTest is Test {
     function test_wouldSettle_reports_validity_without_consuming() public {
         assertTrue(settlement.wouldSettle(MEMBERSHIP, membershipProof, membershipInputs));
         assertFalse(
-            settlement.nullifierUsed(membershipInputs[0]), "pre-flight consumed a nullifier"
+            settlement.nullifierUsed(_nullifierOf(membershipInputs)),
+            "pre-flight consumed a nullifier"
         );
 
         vm.prank(RELAYER);
@@ -299,24 +324,26 @@ contract DraySettlementTest is Test {
     /// root must fail, or membership in one tree would prove membership in
     /// another.
     function testFuzz_arbitrary_root_does_not_verify(bytes32 root) public {
-        vm.assume(root != membershipInputs[1]);
+        vm.assume(root != membershipInputs[0]);
 
         bytes32[] memory inputs = new bytes32[](2);
-        inputs[0] = membershipInputs[0];
-        inputs[1] = root;
+        inputs[0] = root;
+        inputs[1] = membershipInputs[1];
 
         assertFalse(settlement.wouldSettle(MEMBERSHIP, membershipProof, inputs));
     }
 
     /// @dev The nullifier is a public input, so it is covered by the proof.
     /// If an attacker could swap in a fresh nullifier, the replay guard would be
-    /// worthless — they would simply mint a new one per submission.
+    /// worthless — they would simply mint a new one per submission. That the
+    /// circuit now derives it rather than accepting it does not change this:
+    /// the derived value is still committed to by the proof.
     function testFuzz_arbitrary_nullifier_does_not_verify(bytes32 nullifier) public {
-        vm.assume(nullifier != membershipInputs[0]);
+        vm.assume(nullifier != membershipInputs[1]);
 
         bytes32[] memory inputs = new bytes32[](2);
-        inputs[0] = nullifier;
-        inputs[1] = membershipInputs[1];
+        inputs[0] = membershipInputs[0];
+        inputs[1] = nullifier;
 
         assertFalse(settlement.wouldSettle(MEMBERSHIP, membershipProof, inputs));
     }
@@ -327,9 +354,9 @@ contract DraySettlementTest is Test {
         vm.assume(min != 18 || max != 150);
 
         bytes32[] memory inputs = new bytes32[](3);
-        inputs[0] = rangeProofInputs[0];
-        inputs[1] = bytes32(uint256(min));
-        inputs[2] = bytes32(uint256(max));
+        inputs[0] = bytes32(uint256(min));
+        inputs[1] = bytes32(uint256(max));
+        inputs[2] = rangeProofInputs[2];
 
         assertFalse(settlement.wouldSettle(RANGE_PROOF, rangeProofProof, inputs));
     }

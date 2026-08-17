@@ -19,8 +19,9 @@ interface IVerifier {
 /// **It is circuit-agnostic.** Circuits are registered against a verifier
 /// address, and settlement dispatches on a circuit identifier. Adding a circuit
 /// is a registration, not a code change. This works because every Dray circuit
-/// declares its nullifier as public input 0 (ADR-003), so this contract can
-/// find the nullifier without knowing anything else about the circuit's shape.
+/// publishes its nullifier as the *last* public input (ADR-008), so this
+/// contract can find the nullifier without knowing anything else about the
+/// circuit's shape — including how many public inputs it has.
 ///
 /// **It is the second line of defence against replays, not the first.** The
 /// ingest API deduplicates by canonical job hash, but Dray guarantees only
@@ -31,7 +32,7 @@ interface IVerifier {
 contract DraySettlement {
     /// @notice Emitted once per accepted proof.
     /// @param circuitId    Which circuit produced the proof.
-    /// @param nullifier    The consumed nullifier, public input 0.
+    /// @param nullifier    The consumed nullifier, the last public input.
     /// @param relayer      The authorised relayer that submitted it.
     /// @param publicInputs The full public input vector, for off-chain indexing.
     event Settled(
@@ -67,7 +68,7 @@ contract DraySettlement {
 
     /// @notice Nullifiers already consumed. Shared across circuits, which is
     /// safe only because each circuit derives its nullifier under a distinct
-    /// domain separator (ADR-003).
+    /// domain separator (ADR-008).
     mapping(bytes32 => bool) public nullifierUsed;
 
     modifier onlyOwner() {
@@ -93,7 +94,7 @@ contract DraySettlement {
     /// an invalid proof must not be able to burn someone else's nullifier.
     /// @param circuitId    The circuit whose verifier should check this proof.
     /// @param proof        The serialised Honk proof.
-    /// @param publicInputs Public inputs, with the nullifier at index 0.
+    /// @param publicInputs Public inputs, with the nullifier last (ADR-008).
     function settle(bytes32 circuitId, bytes calldata proof, bytes32[] calldata publicInputs)
         external
     {
@@ -103,7 +104,13 @@ contract DraySettlement {
         require(verifier != address(0), UnknownCircuit(circuitId));
         require(publicInputs.length != 0, MissingPublicInputs());
 
-        bytes32 nullifier = publicInputs[0];
+        // Last, not first: every Dray circuit *returns* its nullifier rather
+        // than accepting it, because it is a Pedersen hash of a private input
+        // and no caller can be expected to compute one. Noir places return
+        // values after declared public parameters, so the nullifier lands at
+        // the end — and since circuits differ in how many public parameters
+        // they declare, the end is the only position they can share (ADR-008).
+        bytes32 nullifier = publicInputs[publicInputs.length - 1];
         require(!nullifierUsed[nullifier], NullifierAlreadyUsed(nullifier));
 
         // `verify` is a view function reached by staticcall, so it cannot
@@ -140,7 +147,7 @@ contract DraySettlement {
     {
         address verifier = verifierOf[circuitId];
         if (verifier == address(0) || publicInputs.length == 0) return false;
-        if (nullifierUsed[publicInputs[0]]) return false;
+        if (nullifierUsed[publicInputs[publicInputs.length - 1]]) return false;
 
         try IVerifier(verifier).verify(proof, publicInputs) returns (bool verified) {
             return verified;

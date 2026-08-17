@@ -4,13 +4,18 @@
 //! with a given public root, without revealing which leaf it is.
 //!
 //! Public inputs, in ABI order:
-//!   0. `nullifier` — derived deterministically from the secret
-//!   1. `root`      — the Merkle root the leaf is claimed to belong to
+//!   0. `root`      — the Merkle root the leaf is claimed to belong to
+//!   1. `nullifier` — returned by the circuit, derived from the secret
 //!
-//! **The nullifier is public input 0 by convention, shared with every other
-//! Dray circuit.** `DraySettlement.sol` reads it at that fixed index without
-//! knowing which circuit produced the proof, which is what keeps the
-//! settlement contract circuit-agnostic. See ADR-003.
+//! **The nullifier is the last public input by convention, shared with every
+//! other Dray circuit.** `DraySettlement.sol` reads it from that position
+//! without knowing which circuit produced the proof, which is what keeps the
+//! settlement contract circuit-agnostic. See ADR-008.
+//!
+//! It is *returned* rather than passed in because it is a Pedersen hash of the
+//! secret. A caller supplying it would have to compute that hash themselves,
+//! which means running the very proving stack Dray exists to run for them.
+//! Returning it means the circuit derives it and the ABI publishes it.
 //!
 //! Because the nullifier is a deterministic function of the secret, proving
 //! membership twice with the same secret yields the same nullifier, and the
@@ -30,15 +35,14 @@ pub global TREE_DEPTH: u32 = 20;
 pub global NULLIFIER_DOMAIN: Field = 0x647261795f6d656d626572736869705f6e756c6c6966696572;
 
 fn main(
-    nullifier: pub Field,
     root: pub Field,
     secret: Field,
     leaf_index: Field,
     siblings: [Field; TREE_DEPTH],
-) {
+) -> pub Field {
     let leaf = leaf_commitment(secret);
     assert(compute_merkle_root(leaf, leaf_index, siblings) == root, "merkle root mismatch");
-    assert(derive_nullifier(secret) == nullifier, "nullifier mismatch");
+    derive_nullifier(secret)
 }
 
 /// The leaf stored in the tree is a commitment to the secret, never the secret
@@ -59,16 +63,16 @@ pub fn derive_nullifier(secret: Field) -> Field {
 /// node is the left or the right child at each level. Decomposing it into
 /// exactly `TREE_DEPTH` bits also constrains it to be less than 2^TREE_DEPTH,
 /// so an out-of-range index cannot satisfy the circuit.
-pub fn compute_merkle_root(
-    leaf: Field,
-    leaf_index: Field,
-    siblings: [Field; TREE_DEPTH],
-) -> Field {
+pub fn compute_merkle_root(leaf: Field, leaf_index: Field, siblings: [Field; TREE_DEPTH]) -> Field {
     let path: [bool; TREE_DEPTH] = leaf_index.to_le_bits();
     let mut node = leaf;
     for level in 0..TREE_DEPTH {
         let sibling = siblings[level];
-        let (left, right) = if path[level] { (sibling, node) } else { (node, sibling) };
+        let (left, right) = if path[level] {
+            (sibling, node)
+        } else {
+            (node, sibling)
+        };
         node = std::hash::pedersen_hash([left, right]);
     }
     node
@@ -89,7 +93,8 @@ fn accepts_a_valid_witness() {
     let siblings = [7; TREE_DEPTH];
 
     let root = compute_merkle_root(leaf_commitment(secret), leaf_index, siblings);
-    main(derive_nullifier(secret), root, secret, leaf_index, siblings);
+    let nullifier = main(root, secret, leaf_index, siblings);
+    assert(nullifier == derive_nullifier(secret), "returned the wrong nullifier");
 }
 
 #[test]
@@ -99,13 +104,13 @@ fn accepts_the_leftmost_and_rightmost_leaves() {
 
     let first = 0;
     let root_first = compute_merkle_root(leaf_commitment(secret), first, siblings);
-    main(derive_nullifier(secret), root_first, secret, first, siblings);
+    let _ = main(root_first, secret, first, siblings);
 
     // 2^TREE_DEPTH - 1: every path bit set, so the leaf is the right child the
     // whole way up.
     let last = 1048575;
     let root_last = compute_merkle_root(leaf_commitment(secret), last, siblings);
-    main(derive_nullifier(secret), root_last, secret, last, siblings);
+    let _ = main(root_last, secret, last, siblings);
 }
 
 #[test(should_fail_with = "merkle root mismatch")]
@@ -115,7 +120,7 @@ fn rejects_a_root_that_was_not_derived_from_the_path() {
     let siblings = [7; TREE_DEPTH];
 
     let root = compute_merkle_root(leaf_commitment(secret), leaf_index, siblings);
-    main(derive_nullifier(secret), root + 1, secret, leaf_index, siblings);
+    let _ = main(root + 1, secret, leaf_index, siblings);
 }
 
 #[test(should_fail_with = "merkle root mismatch")]
@@ -126,7 +131,7 @@ fn rejects_a_tampered_sibling() {
 
     let root = compute_merkle_root(leaf_commitment(secret), leaf_index, siblings);
     siblings[3] = 999;
-    main(derive_nullifier(secret), root, secret, leaf_index, siblings);
+    let _ = main(root, secret, leaf_index, siblings);
 }
 
 #[test(should_fail_with = "merkle root mismatch")]
@@ -135,7 +140,7 @@ fn rejects_the_right_leaf_at_the_wrong_index() {
     let siblings = [7; TREE_DEPTH];
 
     let root = compute_merkle_root(leaf_commitment(secret), 5, siblings);
-    main(derive_nullifier(secret), root, secret, 6, siblings);
+    let _ = main(root, secret, 6, siblings);
 }
 
 #[test(should_fail_with = "merkle root mismatch")]
@@ -146,17 +151,25 @@ fn rejects_a_secret_that_is_not_in_the_tree() {
 
     let root = compute_merkle_root(leaf_commitment(secret), leaf_index, siblings);
     // Correct root and path, but a secret whose leaf is not the one committed.
-    main(derive_nullifier(43), root, 43, leaf_index, siblings);
+    let _ = main(root, 43, leaf_index, siblings);
 }
 
-#[test(should_fail_with = "nullifier mismatch")]
-fn rejects_a_nullifier_not_derived_from_the_secret() {
+/// The nullifier is an output, so it cannot be forged by lying on the way in —
+/// there is no input to lie about. What must hold instead is that two proofs
+/// from the same secret publish the *same* nullifier, because that identity is
+/// the whole basis of double-spend rejection at settlement.
+#[test]
+fn the_same_secret_publishes_the_same_nullifier_from_different_positions() {
     let secret = 42;
-    let leaf_index = 5;
     let siblings = [7; TREE_DEPTH];
 
-    let root = compute_merkle_root(leaf_commitment(secret), leaf_index, siblings);
-    main(derive_nullifier(secret) + 1, root, secret, leaf_index, siblings);
+    let root_here = compute_merkle_root(leaf_commitment(secret), 5, siblings);
+    let root_there = compute_merkle_root(leaf_commitment(secret), 9, siblings);
+
+    let from_here = main(root_here, secret, 5, siblings);
+    let from_there = main(root_there, secret, 9, siblings);
+
+    assert(from_here == from_there, "nullifier depends on position");
 }
 
 #[test]
@@ -168,11 +181,14 @@ fn the_nullifier_is_deterministic_and_secret_dependent() {
     assert(derive_nullifier(42) != leaf_commitment(42), "nullifier reveals the leaf");
 }
 
-/// Emits the canonical witness committed in `Prover.toml`.
+/// Emits the canonical witness committed in `Prover.toml`, plus the nullifier
+/// that witness should produce.
 ///
-/// Pedersen hashes cannot be computed by hand, so this is how those values
-/// were produced. Run `nargo test --show-output print_reference_witness` to
-/// regenerate them after any change to the hashing or the tree depth.
+/// Pedersen hashes cannot be computed by hand, so this is how `root` was
+/// produced. The nullifier is no longer an input, but it is printed anyway
+/// because the settlement tests need to know what value to expect on chain.
+/// Run `nargo test --show-output print_reference_witness` to regenerate both
+/// after any change to the hashing or the tree depth.
 #[test]
 fn print_reference_witness() {
     let secret = 42;

@@ -6,6 +6,13 @@
 -- circuits' actual signatures in circuits/*/src/main.nr — nothing checks that
 -- automatically yet, and that gap is recorded in PROGRESS.md.
 --
+-- "Signature" means the circuit's *parameters*, public and private alike, and
+-- nothing else. The worker writes these fields straight into Prover.toml, so a
+-- schema that omits a parameter yields a witness that will not solve, and one
+-- that invents a field yields a witness nargo rejects outright. Nullifiers are
+-- absent from both schemas for that reason: the circuits return them rather
+-- than accept them (ADR-008), so they are outputs, not inputs.
+--
 --   psql "$DATABASE_URL" -f scripts/seed-circuits.sql
 
 INSERT INTO circuits (id, display_name, input_schema, enabled) VALUES
@@ -14,9 +21,14 @@ INSERT INTO circuits (id, display_name, input_schema, enabled) VALUES
     'Merkle membership',
     '{
         "type": "object",
-        "required": ["secret", "leaf_index", "siblings"],
+        "required": ["root", "secret", "leaf_index", "siblings"],
         "additionalProperties": false,
         "properties": {
+            "root": {
+                "type": "string",
+                "description": "Public Merkle root the leaf is claimed to belong to.",
+                "pattern": "^(0x[0-9a-fA-F]+|[0-9]+)$"
+            },
             "secret": {
                 "type": "string",
                 "description": "Private value whose commitment is the leaf.",

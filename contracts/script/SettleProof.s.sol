@@ -32,7 +32,7 @@ contract SettleProof is Script {
 
         console.log("circuit:    %s", circuit);
         console.log("proof:      %s bytes", proof.length);
-        console.log("nullifier:  %s", vm.toString(publicInputs[0]));
+        console.log("nullifier:  %s", vm.toString(publicInputs[publicInputs.length - 1]));
 
         require(
             settlement.wouldSettle(circuitId, proof, publicInputs),
@@ -42,7 +42,10 @@ contract SettleProof is Script {
         vm.broadcast(relayerKey);
         settlement.settle(circuitId, proof, publicInputs);
 
-        require(settlement.nullifierUsed(publicInputs[0]), "nullifier was not consumed");
+        require(
+            settlement.nullifierUsed(publicInputs[publicInputs.length - 1]),
+            "nullifier was not consumed"
+        );
         console.log("settled, nullifier consumed");
 
         // Replay must now be impossible.

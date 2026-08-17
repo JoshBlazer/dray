@@ -121,7 +121,9 @@ done
 log "Confirming settlement state on chain"
 # ---------------------------------------------------------------------------
 for circuit in "${CIRCUITS[@]}"; do
-    nullifier="0x$(head -c 32 "$CIRCUITS_DIR/target/$circuit/public_inputs" | xxd -p -c 32)"
+    # The nullifier is the *last* public input, not the first (ADR-008), and
+    # the circuits publish different numbers of them, so take it from the end.
+    nullifier="0x$(tail -c 32 "$CIRCUITS_DIR/target/$circuit/public_inputs" | xxd -p -c 32)"
     used="$(cast call "$SETTLEMENT" "nullifierUsed(bytes32)(bool)" "$nullifier" --rpc-url "$RPC_URL")"
     [[ "$used" == "true" ]] || die "$circuit nullifier $nullifier is not marked consumed on chain"
     echo "  $circuit: nullifier consumed on chain"

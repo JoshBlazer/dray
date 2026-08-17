@@ -157,11 +157,14 @@ Relevant to Phase 3, when the worker takes over invoking these tools:
 
 ### Known sharp edges from Phase 1
 
-- **The ADR-003 convention is not compiler-enforced.** A new circuit that
-  declares its public inputs in the wrong order would have `DraySettlement`
-  read some other field as a nullifier. `test_public_input_layout_matches_adr_003`
-  asserts it for the two circuits that exist; there is nothing stopping a third
-  from getting it wrong. This belongs in `docs/DESIGN.md`.
+- **The nullifier convention is not compiler-enforced.** A new circuit that
+  returned a second value, or accepted its nullifier as a parameter, would have
+  `DraySettlement` read some other field as a nullifier.
+  `test_public_input_layout_matches_adr_008` asserts it for the two circuits
+  that exist; there is nothing stopping a third from getting it wrong. Note
+  that returning the nullifier (ADR-008) makes this harder to get wrong than
+  the original index-0 rule did, because the position is now a consequence of
+  the signature rather than an ordering the author has to remember.
 - **Verifier bytecode is 18.1 KB against a 24,576 B limit.** Roughly 6.4 KB of
   headroom. A materially larger circuit could exceed EIP-170, and the failure
   would appear at deployment, not at compile time.
@@ -200,10 +203,11 @@ gcc 15.2.0, libc6-dev, and GNU Make 4.4.1. `make build`, `make test`, and
 | 2026-08-11 | Redis runs with persistence disabled in Compose | Redis is a cache, never truth. Making it non-durable in dev forces the recovery path to be exercised rather than assumed | Default RDB snapshotting, which would quietly let Redis become load-bearing |
 | 2026-08-11 | ADR-002: pin `nargo` 1.0.0-beta.22 and `bb` 5.0.0-nightly.20260522 | Unpinned install produced a broken pair — `bbup` could not resolve a backend for the Noir `noirup` had just installed. Reproducibility for a stranger cloning the repo is a stated requirement | Latest-of-both (breaks today), or an undocumented pairing (may fail at verifier generation, deep into Phase 1) |
 | 2026-08-11 | Phase 0 crates carry no third-party dependencies | Keeps the harness itself trivially verifiable; dependencies arrive with the features that need them | Wiring axum, tokio, and sqlx up front, which would make a green build prove less |
-| 2026-08-12 | ADR-003: every circuit declares `nullifier` as public input 0 | Lets `DraySettlement` find the nullifier without knowing the circuit, which is what makes it genuinely circuit-agnostic | Per-circuit adapters in the contract (a code change per circuit), or a nullifier passed alongside the proof (unbound, so forgeable) |
+| 2026-08-12 | ADR-003: every circuit declares `nullifier` as public input 0 — **superseded by ADR-008** | Lets `DraySettlement` find the nullifier without knowing the circuit, which is what makes it genuinely circuit-agnostic | Per-circuit adapters in the contract (a code change per circuit), or a nullifier passed alongside the proof (unbound, so forgeable) |
 | 2026-08-12 | ADR-004: batching deferred to v1.1 | Decided by the human. Keeps the v1.0 contract surface small and the replay tests focused | Batching in v1.0, which would mean choosing between an aggregation circuit and a verification loop under time pressure |
 | 2026-08-12 | Pedersen for hashing, not Poseidon | Poseidon is not in this Noir's stdlib and would mean an external dependency; `std::hash::pedersen_hash` is built in | Poseidon2 via an external package, adding a dependency to pin and audit for no benefit at this stage |
 | 2026-08-12 | `wouldSettle` catches verifier reverts and returns false | Found by a fuzz test: the generated verifier reverts rather than returning false, which made pre-flight useless for its one job | Letting the revert propagate, which would give the relayer an exception instead of an answer |
+| 2026-08-17 | ADR-008: circuits *return* the nullifier, so it is the last public input | Found while wiring the worker: a supplied nullifier is a Pedersen hash of private data, so requiring one means the client must run a proving stack to place an order. Also exposed that `membership`'s registered schema was missing `root`, making every submittable job unsolvable | Pedersen in Rust in the worker (two implementations to keep in exact agreement, diverging only after a proof has been paid for), or client-computed nullifiers (defeats the product) |
 
 ## Open questions (for the human)
 

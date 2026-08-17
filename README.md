@@ -172,12 +172,19 @@ make e2e-circuits   # the whole path: input -> proof -> settled on Anvil
 ### Adding a circuit
 
 The settlement contract is circuit-agnostic, which imposes exactly one rule:
-**every circuit must declare `nullifier` as its first public input.**
-`DraySettlement` reads `publicInputs[0]` without knowing which circuit produced
-the proof, so a circuit that orders its public inputs differently would have
-some unrelated field treated as its nullifier. Use a distinct domain separator
-when deriving it, or a secret reused across circuits will collide in the shared
-nullifier set. See [ADR-003](DECISIONS.md).
+**every circuit must `return` its nullifier, and nothing else.** Noir places
+return values after the declared public parameters, so the nullifier ends up
+last in the public input vector, and `DraySettlement` reads
+`publicInputs[publicInputs.length - 1]` without knowing which circuit produced
+the proof. A circuit that returned a second value, or that accepted its
+nullifier as a parameter instead, would have some unrelated field treated as
+its nullifier.
+
+Return it rather than accept it. A nullifier is a hash of private data, so a
+circuit that takes one as input forces the *caller* to compute it — which means
+running the proving stack Dray exists to run for them. Use a distinct domain
+separator when deriving it, or a secret reused across circuits will collide in
+the shared nullifier set. See [ADR-008](DECISIONS.md).
 
 Then: add the package to `circuits/Nargo.toml`, add its name to the `CIRCUITS`
 array in `scripts/prove.sh` and `scripts/e2e-circuits.sh`, and register the
