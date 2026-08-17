@@ -1,7 +1,7 @@
 # Dray — Progress
 
-**Current phase:** 2 — Ingest API and durable job store (complete) → 3 — Worker pool
-**Last updated:** 2026-08-12
+**Current phase:** 3 — Proof worker pool (in progress)
+**Last updated:** 2026-08-17
 **Build status:** green — `make build`, `make test`, and `make lint` pass
 locally, and CI is green on a fresh clone across all five jobs.
 Repository: <https://github.com/JoshBlazer/dray>
@@ -13,7 +13,7 @@ Repository: <https://github.com/JoshBlazer/dray>
 | 0 | Foundations | done | yes | CI green on a fresh clone (run 31593551054). One caveat on `make up` — see below |
 | 1 | Circuits and on-chain verification | done | yes | `make e2e-circuits` proves both circuits and settles them on Anvil |
 | 2 | Ingest API and durable job store | done | yes | Verified in CI against real Postgres; not yet locally (no Docker) |
-| 3 | Proof worker pool | not started | no | Chaos tests need local Docker |
+| 3 | Proof worker pool | in progress | no | Leasing, resource bounds, and the proving pipeline done; lease loop, shutdown, metrics, and the chaos test remain |
 | 4 | Relayer and on-chain settlement | not started | no | |
 | 5 | Observability, operations, hardening | not started | no | |
 | 6 | Documentation, demo, release | not started | no | |
@@ -222,37 +222,63 @@ gcc 15.2.0, libc6-dev, and GNU Make 4.4.1. `make build`, `make test`, and
 
 ## Next actions
 
-Phase 2 is closed. Phase 3 — the proof worker pool — is next, and it is the
-phase the spec calls out as carrying the single most important engineering
-detail: resource bounding.
+Phase 3 — the proof worker pool — is under way. It is the phase the spec calls
+out as carrying the single most important engineering detail: resource
+bounding.
 
-1. Lease acquisition with `SELECT ... FOR UPDATE SKIP LOCKED`, mirrored into
-   Redis for fast liveness checks. Redis becomes load-bearing for the first
-   time — and must stay rebuildable from Postgres.
-2. Lease renewal heartbeat during long proofs; expiry returns the job to
-   `queued`. The state machine already models this; nothing drives it yet.
-3. Subprocess execution of `nargo`/`bb` under a wall-clock timeout, a memory
-   ceiling, and a CPU quota, with a scratch directory cleaned up on every exit
-   path including panic.
-4. Attempt accounting with exponential backoff and jitter. `classify_failure`
-   in `dray-core` already decides retry-versus-fail; the worker has to call it.
-5. Graceful shutdown on SIGTERM: stop leasing, finish or cleanly abandon the
-   current job, release leases.
-6. Prometheus metrics: queue depth, lease age, proving duration, peak memory,
+Done:
+
+1. **Lease acquisition** with `SELECT ... FOR UPDATE SKIP LOCKED`, plus
+   renewal and reaping. 12 store integration tests, headlined by twenty
+   workers racing for ten jobs. The attempt counter increments *at lease
+   time*, because a worker killed mid-proof never reports anything and a
+   counter advanced only on completion would let a poison job retry for ever.
+2. **Resource-bounded subprocess execution** — wall clock, `RLIMIT_AS`, and
+   `RLIMIT_CPU`, applied through `sh`'s `ulimit` before `exec` so the
+   workspace's `unsafe_code = "forbid"` survives. Scratch cleanup lives in
+   `Drop`, so it runs on panic too. 16 tests driving real failures rather than
+   mocks.
+3. **The proving pipeline** — `Prover.toml` from job inputs, `nargo execute`,
+   `bb prove -t evm`, both bounded. Each job gets a private copy of the circuit
+   package; `nargo` uses fixed paths inside the package directory, so a shared
+   one would let concurrent jobs overwrite each other's witnesses and produce a
+   proof recorded against the wrong inputs. 10 integration tests against the
+   real toolchain assert the worker reproduces the exact nullifiers
+   `e2e-circuits.sh` settles on chain.
+4. **Exponential backoff with jitter**, drawn from `[base/2, base]` so a shared
+   outage does not resynchronise the fleet on every subsequent attempt.
+
+Remaining:
+
+5. The lease loop itself: lease, heartbeat during the proof, record the result.
+   Losing a renewal must abandon the work rather than race the new owner.
+6. Graceful shutdown on SIGTERM: stop leasing, finish or cleanly abandon the
+   current job, release leases so the next worker need not wait out the TTL.
+7. Prometheus metrics: queue depth, lease age, proving duration, peak memory,
    timeouts, OOMs, attempt distribution.
+8. Mirror lease TTL into Redis for fast liveness checks. Redis becomes
+   load-bearing for the first time — and must stay rebuildable from Postgres.
 
 **Exit criterion:** a chaos test that randomly kills workers during a 100-job
 run, after which every job has settled exactly once in the store and none are
 lost.
 
-Two things carried forward from earlier phases that Phase 3 depends on:
+### What Phase 3 has cost so far
 
-- `bb` needs the verification key on disk before it will prove, so the worker
-  must generate the vk once per circuit at registration rather than per job.
-- Measured proving cost is 1.9–2.5 s and ~42 MB peak RSS per proof on a
-  4-core box. The default memory ceiling and timeout should be derived from
-  those numbers rather than guessed, with enough headroom that a normal proof
-  never trips them.
+Wiring the worker exposed a design error two phases old. ADR-003 had every
+circuit accept its nullifier as public input 0, which was never exercised
+because Phases 1 and 2 only ever used hand-committed reference witnesses. The
+moment the worker had to *build* a witness from client inputs, it became clear
+nobody could supply that nullifier: it is a Pedersen hash of private data, so
+the client would need a proving stack to place an order and the worker would
+need a second Pedersen implementation that agreed with Noir's exactly.
 
-Docker now works locally, so Phase 3's chaos and contention tests have
-somewhere to run. That was the last environmental blocker.
+The same investigation found that `membership`'s registered input schema
+omitted `root` entirely — no submittable job could ever have produced a
+solvable witness.
+
+Both are fixed under ADR-008: circuits return the nullifier, so it lands last
+in the public input vector. It cost the circuits, the settlement contract, two
+scripts, and 25 contract tests. The lesson is recorded here rather than only in
+the ADR: a single job proved end to end during Phase 1 would have caught both
+before anything was built on top of them.

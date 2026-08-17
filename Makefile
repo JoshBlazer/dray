@@ -29,7 +29,7 @@ BB_BIN := $(HOME)/.bb
 FOUNDRY_BIN := $(FOUNDRY_DIR)/bin
 ZK_PATH := $(NARGO_BIN):$(BB_BIN):$(FOUNDRY_BIN)
 
-.PHONY: help setup setup-zk versions build test test-integration reset-test-db lint fmt up down clean seed api \
+.PHONY: help setup setup-zk versions build test test-integration test-proving reset-test-db lint fmt up down clean seed api \
         circuits contracts prove e2e-circuits e2e
 
 help: ## Show this help
@@ -118,6 +118,11 @@ test-integration: ## Run the tests that need a live Postgres (requires make up)
 		$(COMPOSE) exec -T postgres psql -U dray -d dray -c "CREATE DATABASE dray_test"
 	DATABASE_URL="$(TEST_DATABASE_URL)" $(CARGO) test -p dray-store --features integration-tests
 	DATABASE_URL="$(TEST_DATABASE_URL)" $(CARGO) test -p dray-api --features integration-tests
+
+test-proving: ## Run the worker tests that shell out to a real nargo and bb (requires make setup-zk)
+	@# No live database needed — these exercise the proving pipeline alone, and
+	@# assert the worker reproduces the same nullifiers e2e-circuits settles.
+	PATH="$(ZK_PATH):$$PATH" $(CARGO) test -p dray-worker --features proving-tests
 
 reset-test-db: ## Drop and recreate the integration-test database
 	$(COMPOSE) exec -T postgres psql -U dray -d dray -c "DROP DATABASE IF EXISTS dray_test"

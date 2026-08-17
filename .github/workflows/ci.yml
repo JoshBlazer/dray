@@ -164,6 +164,18 @@ jobs:
       - name: Contract tests
         run: make contracts
 
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The worker's proving pipeline against the real toolchain. This is the
+      # only job with `nargo` and `bb` installed, so it is the only place these
+      # can run — and they are what proves the worker's generated Prover.toml
+      # agrees with the circuits, the verification keys, and Barretenberg.
+      # They assert the worker reproduces the exact nullifiers the e2e step
+      # below settles on chain, so the two cannot drift apart silently.
+      - name: Worker proving tests
+        run: cargo test -p dray-worker --features proving-tests
+
       - name: End-to-end against Anvil
         run: make e2e-circuits
 
