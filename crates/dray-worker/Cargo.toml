@@ -17,6 +17,12 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 uuid = "1.24.0"
 
+[features]
+# Tests that shell out to a real `nargo` and `bb`. Off by default so a fresh
+# clone can `cargo test` without the ZK toolchain installed; see
+# `tests/proving.rs` for why they fail loudly rather than skip.
+proving-tests = []
+
 [lints]
 workspace = true
 

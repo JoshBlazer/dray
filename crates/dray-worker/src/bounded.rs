@@ -72,6 +72,22 @@ impl Bounds {
             cpu_seconds: 100,
         }
     }
+
+    /// Bounds for one-off startup work: compiling circuits and writing
+    /// verification keys.
+    ///
+    /// Looser than [`Bounds::for_proving`] because these run once per worker
+    /// rather than once per job, and because failing them is fatal to startup
+    /// rather than a retryable job failure. Still bounded: a worker that hangs
+    /// on startup is harder to diagnose than one that exits saying why.
+    #[must_use]
+    pub fn for_preparation() -> Self {
+        Self {
+            wall_clock: Duration::from_secs(600),
+            address_space_kb: 8 * 1024 * 1024, // 8 GiB
+            cpu_seconds: 550,
+        }
+    }
 }
 
 /// Why a bounded run did not succeed.
@@ -291,7 +307,7 @@ fn classify_exit(code: Option<i32>, stderr: &str, bounds: Bounds) -> BoundedErro
         Some(c) if c > SIGNAL_EXIT_BASE => BoundedError::Killed {
             signal: c - SIGNAL_EXIT_BASE,
         },
-        Some(c) if looks_like_oom => BoundedError::AddressSpaceExceeded {
+        Some(_) if looks_like_oom => BoundedError::AddressSpaceExceeded {
             limit_kb: bounds.address_space_kb,
         },
         Some(c) => BoundedError::Failed {
