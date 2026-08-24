@@ -41,7 +41,7 @@ pub const COMPONENT: &str = "dray-store";
 /// change what this code reads.
 const JOB_COLUMNS: &str = "id, circuit_id, job_hash, idempotency_key, inputs, \
      state::text AS state, attempts, max_attempts, last_error, leased_by, proof, \
-     created_at, updated_at";
+     retry_after, created_at, updated_at";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -94,6 +94,9 @@ pub struct Job {
     pub last_error: Option<String>,
     pub leased_by: Option<String>,
     pub proof: Option<Vec<u8>>,
+    /// Earliest time this job may be leased again; `None` means immediately.
+    /// Set by [`Store::record_failure`] when a retry is scheduled.
+    pub retry_after: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -114,6 +117,7 @@ impl Job {
             last_error: row.try_get("last_error")?,
             leased_by: row.try_get("leased_by")?,
             proof: row.try_get("proof")?,
+            retry_after: row.try_get("retry_after")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
         })
@@ -431,9 +435,12 @@ impl Store {
     ) -> Result<Option<Job>, StoreError> {
         let mut tx = self.pool.begin().await?;
 
+        // `retry_after` is compared against the database clock, not the
+        // worker's. Workers disagree about the time; the queue must not.
         let candidate = sqlx::query(
             "SELECT id FROM jobs
              WHERE state = 'queued'
+               AND (retry_after IS NULL OR retry_after <= now())
              ORDER BY created_at
              FOR UPDATE SKIP LOCKED
              LIMIT 1",
@@ -455,7 +462,8 @@ impl Store {
                  state            = $2::job_state,
                  leased_by        = $3,
                  lease_expires_at = now() + make_interval(secs => $4),
-                 attempts         = attempts + 1
+                 attempts         = attempts + 1,
+                 retry_after      = NULL
              WHERE id = $1
              RETURNING {JOB_COLUMNS}"
         );
@@ -702,6 +710,7 @@ impl Store {
         worker_id: &str,
         kind: dray_core::FailureKind,
         error: &str,
+        retry_in: Option<std::time::Duration>,
     ) -> Result<Job, StoreError> {
         let mut tx = self.pool.begin().await?;
 
@@ -726,12 +735,26 @@ impl Store {
         );
         let next = transition(from, event)?;
 
+        // The delay is applied only when the job is actually going back on the
+        // queue. A `failed` or `rejected` job carries no retry, and the schema
+        // refuses one — a scheduled retry on a terminal job would be invisible
+        // and permanent, since nothing would ever lease it to clear the field.
+        let retry_seconds = if next == JobState::Queued {
+            retry_in.map(|d| d.as_secs_f64())
+        } else {
+            None
+        };
+
         let update = format!(
             "UPDATE jobs SET
                  state            = $2::job_state,
                  last_error       = $3,
                  leased_by        = NULL,
-                 lease_expires_at = NULL
+                 lease_expires_at = NULL,
+                 retry_after      = CASE
+                     WHEN $4::double precision IS NULL THEN NULL
+                     ELSE now() + make_interval(secs => $4::double precision)
+                 END
              WHERE id = $1
              RETURNING {JOB_COLUMNS}"
         );
@@ -739,6 +762,7 @@ impl Store {
             .bind(id)
             .bind(next.as_str())
             .bind(error)
+            .bind(retry_seconds)
             .fetch_one(&mut *tx)
             .await?;
 

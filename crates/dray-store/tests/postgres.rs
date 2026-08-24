@@ -830,6 +830,7 @@ async fn a_transient_failure_returns_the_job_for_retry() {
             "worker-1",
             dray_core::FailureKind::Transient,
             "bb exited 137",
+            None,
         )
         .await
         .unwrap();
@@ -868,6 +869,7 @@ async fn attempts_are_exhausted_after_the_budget() {
                 "worker-1",
                 dray_core::FailureKind::Transient,
                 "transient",
+                None,
             )
             .await
             .unwrap();
@@ -898,6 +900,7 @@ async fn a_permanent_failure_is_not_retried() {
             "worker-1",
             dray_core::FailureKind::Permanent,
             "witness does not satisfy the circuit",
+            None,
         )
         .await
         .unwrap();
@@ -952,6 +955,7 @@ async fn the_transition_history_records_the_whole_cycle() {
             "worker-1",
             dray_core::FailureKind::Transient,
             "timed out",
+            None,
         )
         .await
         .unwrap();
@@ -993,5 +997,235 @@ async fn the_transition_history_records_the_whole_cycle() {
                 JobState::Proved
             ),
         ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Retry scheduling
+//
+// Backoff is only real if it is durable. A worker that slept locally before
+// retrying would change nothing: it releases the job on failure, and the next
+// worker to call `lease_next` takes it immediately. These tests exercise the
+// delay from the queue's side, which is the side that matters.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_scheduled_retry_is_not_leasable_before_it_is_due() {
+    let store = isolated_store("retry_pending").await;
+    let ids = seed_jobs(&store, 1).await;
+
+    store
+        .lease_next("worker-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let failed = store
+        .record_failure(
+            ids[0],
+            "worker-1",
+            dray_core::FailureKind::Transient,
+            "bb exited 137",
+            Some(Duration::from_secs(3600)),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(failed.state, JobState::Queued);
+    assert!(
+        failed.retry_after.is_some(),
+        "a delayed retry should be recorded on the row"
+    );
+
+    assert!(
+        store
+            .lease_next("worker-2", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .is_none(),
+        "a job backing off must not be handed to the next worker to ask"
+    );
+
+    // Still counted as queued depth: it is waiting, not gone. An operator
+    // watching the queue should see it.
+    assert_eq!(store.queue_depth().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn a_scheduled_retry_becomes_leasable_once_it_is_due() {
+    let store = isolated_store("retry_due").await;
+    let ids = seed_jobs(&store, 1).await;
+
+    store
+        .lease_next("worker-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .record_failure(
+            ids[0],
+            "worker-1",
+            dray_core::FailureKind::Transient,
+            "transient",
+            Some(Duration::from_millis(300)),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .lease_next("worker-2", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .is_none(),
+        "not due yet"
+    );
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let leased = store
+        .lease_next("worker-2", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("should be leasable once the delay has elapsed");
+
+    assert_eq!(leased.id, ids[0]);
+    assert_eq!(leased.attempts, 2, "the retry is a second attempt");
+    assert!(
+        leased.retry_after.is_none(),
+        "leasing must clear the schedule, or the field would outlive its meaning"
+    );
+}
+
+/// A backed-off job must not block jobs that are ready. `SKIP LOCKED` handles
+/// contention; this is the ordering case, and getting it wrong would stall the
+/// whole queue behind one unlucky job.
+#[tokio::test]
+async fn a_job_backing_off_does_not_block_a_ready_one() {
+    let store = isolated_store("retry_headline").await;
+    let ids = seed_jobs(&store, 2).await;
+
+    // Fail the *oldest* job, so it would sort first without the filter.
+    store
+        .lease_next("worker-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .record_failure(
+            ids[0],
+            "worker-1",
+            dray_core::FailureKind::Transient,
+            "transient",
+            Some(Duration::from_secs(3600)),
+        )
+        .await
+        .unwrap();
+
+    let leased = store
+        .lease_next("worker-2", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("the second job is ready and must still be served");
+
+    assert_eq!(leased.id, ids[1]);
+}
+
+/// A terminal job has no retry, and the schema refuses one — a scheduled retry
+/// on a job nothing will ever lease would be invisible and permanent.
+#[tokio::test]
+async fn a_permanent_failure_schedules_no_retry() {
+    let store = isolated_store("retry_permanent").await;
+    let ids = seed_jobs(&store, 1).await;
+
+    store
+        .lease_next("worker-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let failed = store
+        .record_failure(
+            ids[0],
+            "worker-1",
+            dray_core::FailureKind::Permanent,
+            "witness does not satisfy the circuit",
+            Some(Duration::from_secs(3600)),
+        )
+        .await
+        .expect("a delay on a permanent failure should be ignored, not rejected");
+
+    assert_eq!(failed.state, JobState::Failed);
+    assert!(
+        failed.retry_after.is_none(),
+        "a terminal job must carry no retry schedule"
+    );
+}
+
+/// Exhausting the attempt budget is also terminal, and takes the same path.
+#[tokio::test]
+async fn an_exhausted_job_schedules_no_retry() {
+    let store = isolated_store("retry_exhausted").await;
+    let ids = seed_jobs(&store, 1).await;
+
+    let mut last = None;
+    for _ in 0..3 {
+        store
+            .lease_next("worker-1", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        last = Some(
+            store
+                .record_failure(
+                    ids[0],
+                    "worker-1",
+                    dray_core::FailureKind::Transient,
+                    "transient",
+                    // No delay, so the next attempt can be taken immediately.
+                    None,
+                )
+                .await
+                .unwrap(),
+        );
+    }
+
+    let failed = last.expect("three attempts were made");
+    assert_eq!(failed.state, JobState::Failed, "budget is three attempts");
+    assert!(failed.retry_after.is_none());
+}
+
+/// The database's clock is authoritative. Two workers with skewed clocks must
+/// agree on when a job is due, so the interval is computed from `now()` inside
+/// the same statement rather than from a timestamp a worker calculated.
+#[tokio::test]
+async fn the_retry_deadline_is_measured_by_the_database() {
+    let store = isolated_store("retry_clock").await;
+    let ids = seed_jobs(&store, 1).await;
+
+    store
+        .lease_next("worker-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let before = chrono::Utc::now();
+    let failed = store
+        .record_failure(
+            ids[0],
+            "worker-1",
+            dray_core::FailureKind::Transient,
+            "transient",
+            Some(Duration::from_secs(60)),
+        )
+        .await
+        .unwrap();
+    let after = chrono::Utc::now();
+
+    let retry_after = failed.retry_after.expect("should be scheduled");
+    assert!(
+        retry_after >= before + chrono::Duration::seconds(59)
+            && retry_after <= after + chrono::Duration::seconds(61),
+        "retry_after {retry_after} is not about 60s from now ({before} .. {after})"
     );
 }
