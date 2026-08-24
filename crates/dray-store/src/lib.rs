@@ -550,7 +550,7 @@ impl Store {
         let mut tx = self.pool.begin().await?;
 
         let expired = sqlx::query(
-            "SELECT id, state::text AS state FROM jobs
+            "SELECT id, state::text AS state, attempts, max_attempts FROM jobs
              WHERE state IN ('leased', 'proving')
                AND lease_expires_at < now()
              FOR UPDATE SKIP LOCKED",
@@ -564,17 +564,46 @@ impl Store {
             let state_name: String = row.try_get("state")?;
             let from = JobState::from_str(&state_name)
                 .map_err(|e| StoreError::Corrupt(format!("job.state: {e}")))?;
-            let next = transition(from, JobEvent::LeaseExpired)?;
+            let attempts: i32 = row.try_get("attempts")?;
+            let max_attempts: i32 = row.try_get("max_attempts")?;
+
+            // An expired lease is a transient failure — but it still spends an
+            // attempt, and the budget still has to be honoured. Without this, a
+            // job whose input kills whatever worker touches it would be handed
+            // out for ever, taking down one worker after another. The attempt
+            // counter exists precisely to bound that, and it only bounds
+            // anything if the reaper consults it.
+            let event = dray_core::classify_failure(
+                dray_core::FailureKind::Transient,
+                attempts.max(0).unsigned_abs(),
+                max_attempts.max(1).unsigned_abs(),
+            );
+            let event = if event == JobEvent::RetryScheduled {
+                // The lease expiring *is* the event; `retry_scheduled` would
+                // claim a decision this code did not make.
+                JobEvent::LeaseExpired
+            } else {
+                event
+            };
+            let next = transition(from, event)?;
+
+            let detail = if next == JobState::Failed {
+                "lease expired without renewal; attempts exhausted"
+            } else {
+                "lease expired without renewal"
+            };
 
             sqlx::query(
                 "UPDATE jobs SET
                      state            = $2::job_state,
                      leased_by        = NULL,
-                     lease_expires_at = NULL
+                     lease_expires_at = NULL,
+                     last_error       = $3
                  WHERE id = $1",
             )
             .bind(id)
             .bind(next.as_str())
+            .bind(detail)
             .execute(&mut *tx)
             .await?;
 
@@ -589,13 +618,14 @@ impl Store {
 
             sqlx::query(
                 "INSERT INTO job_transitions (job_id, from_state, event, to_state, actor, detail)
-                 VALUES ($1, $2::job_state, 'lease_expired'::job_event, $3::job_state, $4, $5)",
+                 VALUES ($1, $2::job_state, $3::job_event, $4::job_state, $5, $6)",
             )
             .bind(id)
             .bind(from.as_str())
+            .bind(event.as_str())
             .bind(next.as_str())
             .bind(reaper)
-            .bind("lease expired without renewal")
+            .bind(detail)
             .execute(&mut *tx)
             .await?;
 

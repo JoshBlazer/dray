@@ -18,7 +18,9 @@
 
 pub mod backoff;
 pub mod bounded;
+pub mod config;
 pub mod prover;
+pub mod worker;
 
 /// Component name used in logs and metrics.
 pub const COMPONENT: &str = "dray-worker";

@@ -1229,3 +1229,85 @@ async fn the_retry_deadline_is_measured_by_the_database() {
         "retry_after {retry_after} is not about 60s from now ({before} .. {after})"
     );
 }
+
+/// A job whose lease expires has spent an attempt, and the budget has to be
+/// honoured on that path too. Without this, an input that kills whatever worker
+/// touches it would be handed out for ever, taking down one worker after
+/// another — which is precisely what the attempt counter exists to bound.
+#[tokio::test]
+async fn reaping_fails_a_job_whose_attempts_are_exhausted() {
+    let store = isolated_store("reap_exhausted").await;
+    let ids = seed_jobs(&store, 1).await;
+
+    // Lease and abandon three times, matching the default budget. A zero TTL
+    // means the lease is already expired when the reaper looks.
+    for expected_attempt in 1..=3 {
+        let leased = store
+            .lease_next("doomed-worker", Duration::from_secs(0))
+            .await
+            .unwrap()
+            .expect("should still be leasable");
+        assert_eq!(leased.attempts, expected_attempt);
+
+        let reaped = store.reap_expired_leases("reaper").await.unwrap();
+        assert_eq!(reaped, vec![ids[0]]);
+    }
+
+    let job = store.job(ids[0]).await.unwrap().unwrap();
+    assert_eq!(
+        job.state,
+        JobState::Failed,
+        "a job that has burned its whole budget on expired leases must stop \
+         being handed out"
+    );
+    assert!(job.leased_by.is_none());
+    assert!(
+        job.last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("attempts exhausted")),
+        "the reason should say what happened: {:?}",
+        job.last_error
+    );
+
+    assert!(
+        store
+            .lease_next("another-worker", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .is_none(),
+        "a failed job must not be leasable"
+    );
+}
+
+/// Below the budget, an expired lease is an ordinary return to the queue.
+#[tokio::test]
+async fn reaping_returns_a_job_with_attempts_left_to_the_queue() {
+    let store = isolated_store("reap_retryable").await;
+    let ids = seed_jobs(&store, 1).await;
+
+    store
+        .lease_next("doomed-worker", Duration::from_secs(0))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let reaped = store.reap_expired_leases("reaper").await.unwrap();
+    assert_eq!(reaped, vec![ids[0]]);
+
+    let job = store.job(ids[0]).await.unwrap().unwrap();
+    assert_eq!(job.state, JobState::Queued);
+    assert_eq!(job.attempts, 1, "the attempt was still spent");
+    assert!(
+        job.retry_after.is_none(),
+        "an expired lease should be retryable at once; the job may simply have \
+         outlived its worker"
+    );
+
+    let history = store.transitions(ids[0]).await.unwrap();
+    assert!(
+        history
+            .iter()
+            .any(|(_, event, _)| *event == JobEvent::LeaseExpired),
+        "the log should say the lease expired, not invent a decision: {history:?}"
+    );
+}

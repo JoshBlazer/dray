@@ -179,6 +179,45 @@ jobs:
       - name: End-to-end against Anvil
         run: make e2e-circuits
 
+  worker:
+    name: Worker pool under load and chaos
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: dray
+          POSTGRES_PASSWORD: dray
+          POSTGRES_DB: dray
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U dray -d dray"
+          --health-interval 2s --health-timeout 3s --health-retries 15
+    steps:
+      - uses: actions/checkout@v5
+
+      # The only job that needs both a database and the proving toolchain.
+      # Leasing, retries, and shutdown are invisible without a store; proving is
+      # invisible without nargo and bb. The phase's exit criteria need both at
+      # once, so they cannot live in either of the existing jobs.
+      - name: Install the pinned proving toolchain
+        run: |
+          make setup-zk
+          echo "$HOME/.nargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.bb" >> "$GITHUB_PATH"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Includes the 100-job load test and the chaos run that kills workers
+      # mid-proof. Both assert against the transition log rather than against
+      # what the workers reported, so a worker that lied about its own outcome
+      # would still be caught.
+      - name: Worker integration tests
+        env:
+          DATABASE_URL: postgres://dray:dray@localhost:5432/dray
+        run: cargo test -p dray-worker --features integration-tests --test lease_loop
+
   compose:
     name: Dependencies start healthy
     runs-on: ubuntu-latest

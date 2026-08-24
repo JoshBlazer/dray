@@ -23,8 +23,16 @@ uuid = "1.24.0"
 # `tests/proving.rs` for why they fail loudly rather than skip.
 proving-tests = []
 
+# Tests that drive a whole worker: real Postgres *and* real nargo/bb. These are
+# the ones that can say anything about leasing, retries, shutdown, and chaos,
+# because none of that is observable without a store behind it.
+integration-tests = []
+
 [lints]
 workspace = true
 
 [dev-dependencies]
+chrono = "0.4.45"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "migrate"] }
 tempfile = "3.27.0"
+uuid = { version = "1.24.0", features = ["v4"] }

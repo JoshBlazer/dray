@@ -434,9 +434,11 @@ dependencies = [
 name = "dray-worker"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dray-core",
  "dray-store",
  "serde_json",
+ "sqlx",
  "tempfile",
  "thiserror",
  "tokio",

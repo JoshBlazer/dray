@@ -29,7 +29,7 @@ BB_BIN := $(HOME)/.bb
 FOUNDRY_BIN := $(FOUNDRY_DIR)/bin
 ZK_PATH := $(NARGO_BIN):$(BB_BIN):$(FOUNDRY_BIN)
 
-.PHONY: help setup setup-zk versions build test test-integration test-proving reset-test-db lint fmt up down clean seed api \
+.PHONY: help setup setup-zk versions build test test-integration test-proving test-worker reset-test-db lint fmt up down clean seed api worker \
         circuits contracts prove e2e-circuits e2e
 
 help: ## Show this help
@@ -109,6 +109,11 @@ seed: ## Register the circuits with their input schemas
 api: ## Run the ingest API against the local dependencies
 	DATABASE_URL="$(DATABASE_URL)" $(CARGO) run -p dray-api
 
+worker: ## Run a proving worker against the local dependencies
+	@# The worker prepares circuit artefacts at start-up, so it needs the ZK
+	@# toolchain on PATH as well as a database.
+	PATH="$(ZK_PATH):$$PATH" DATABASE_URL="$(DATABASE_URL)" $(CARGO) run -p dray-worker
+
 test-integration: ## Run the tests that need a live Postgres (requires make up)
 	@# A separate database, because the integration tests register a circuit per
 	@# test and would otherwise litter the development database with hundreds of
@@ -123,6 +128,15 @@ test-proving: ## Run the worker tests that shell out to a real nargo and bb (req
 	@# No live database needed — these exercise the proving pipeline alone, and
 	@# assert the worker reproduces the same nullifiers e2e-circuits settles.
 	PATH="$(ZK_PATH):$$PATH" $(CARGO) test -p dray-worker --features proving-tests
+
+test-worker: ## Run the whole-worker tests: load and chaos (needs make up and make setup-zk)
+	@# These need a live Postgres *and* the proving toolchain, which is why they
+	@# are separate from both test-integration and test-proving.
+	@$(COMPOSE) exec -T postgres psql -U dray -d dray -tAc \
+		"SELECT 1 FROM pg_database WHERE datname='dray_test'" | grep -q 1 || \
+		$(COMPOSE) exec -T postgres psql -U dray -d dray -c "CREATE DATABASE dray_test"
+	PATH="$(ZK_PATH):$$PATH" DATABASE_URL="$(TEST_DATABASE_URL)" \
+		$(CARGO) test -p dray-worker --features integration-tests --test lease_loop
 
 reset-test-db: ## Drop and recreate the integration-test database
 	$(COMPOSE) exec -T postgres psql -U dray -d dray -c "DROP DATABASE IF EXISTS dray_test"
