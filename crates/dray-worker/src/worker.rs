@@ -41,7 +41,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use dray_store::{Job, Store};
+use dray_store::{Job, LeaseCache, Store};
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -145,6 +145,10 @@ pub struct Worker {
     config: WorkerConfig,
     prover: ProverConfig,
     metrics: Arc<Metrics>,
+    /// Best-effort mirror of lease state. Optional on purpose: the spec
+    /// requires Postgres to remain recoverable without Redis, and a worker that
+    /// refused to start without a cache would contradict that.
+    leases: Option<LeaseCache>,
 }
 
 impl Worker {
@@ -156,7 +160,19 @@ impl Worker {
             config,
             prover,
             metrics,
+            leases: None,
         }
+    }
+
+    /// Mirror lease state into Redis for fast liveness checks.
+    ///
+    /// Purely additive. Every operation on the mirror is best-effort, so a
+    /// worker with one behaves exactly like a worker without one whenever
+    /// Redis is unavailable.
+    #[must_use]
+    pub fn with_lease_cache(mut self, leases: LeaseCache) -> Self {
+        self.leases = Some(leases);
+        self
     }
 
     /// Share this worker's metrics, so the process can expose them for scraping.
@@ -261,12 +277,19 @@ impl Worker {
             return Outcome::LeaseLost(id);
         }
 
+        if let Some(leases) = &self.leases {
+            leases
+                .record(id, &self.config.worker_id, self.config.lease_ttl)
+                .await;
+        }
+
         let mut heartbeat = TaskGuard::spawn(heartbeat(
             self.store.clone(),
             id,
             self.config.worker_id.clone(),
             self.config.lease_ttl,
             self.config.heartbeat_interval,
+            self.leases.clone(),
         ));
 
         // The label separates this attempt's scratch directory from any other,
@@ -304,6 +327,15 @@ impl Worker {
                 }
             }
         };
+
+        // The job is no longer this worker's, whatever happened to it. Leaving
+        // the mirror claiming it would make a queued job look busy until the
+        // key expired. `LeaseLost` is included deliberately: the entry there
+        // belongs to whoever holds the job now, and their own `record` has
+        // already overwritten it.
+        if let Some(leases) = &self.leases {
+            leases.forget(id).await;
+        }
 
         outcome
     }
@@ -395,7 +427,14 @@ impl Worker {
 /// Returns only when the lease is definitively lost. An error is not loss: see
 /// the module documentation for why a database blip must not discard a proof
 /// that is still running.
-async fn heartbeat(store: Store, id: Uuid, worker_id: String, ttl: Duration, interval: Duration) {
+async fn heartbeat(
+    store: Store,
+    id: Uuid,
+    worker_id: String,
+    ttl: Duration,
+    interval: Duration,
+    leases: Option<LeaseCache>,
+) {
     let mut ticker = tokio::time::interval(interval);
     // `interval` fires immediately on the first tick; the lease was just
     // granted, so skip it.
@@ -404,7 +443,14 @@ async fn heartbeat(store: Store, id: Uuid, worker_id: String, ttl: Duration, int
     loop {
         ticker.tick().await;
         match store.renew_lease(id, &worker_id, ttl).await {
-            Ok(true) => tracing::debug!(job = %id, "lease renewed"),
+            Ok(true) => {
+                // Postgres first, then the mirror. The other order could leave
+                // the mirror advertising a lease Postgres refused to extend.
+                if let Some(leases) = &leases {
+                    leases.record(id, &worker_id, ttl).await;
+                }
+                tracing::debug!(job = %id, "lease renewed");
+            }
             Ok(false) => return,
             Err(err) => {
                 tracing::warn!(job = %id, error = %err, "lease renewal failed; will retry");

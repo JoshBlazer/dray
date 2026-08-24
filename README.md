@@ -53,8 +53,9 @@ make setup            # verify prerequisites, install rustfmt and clippy
 make up               # start Postgres and Redis, wait for healthy
 make seed             # register the circuits and their input schemas
 make test             # unit and property tests, no database needed
-make test-integration # tests that need the live Postgres
+make test-integration # tests that need the live Postgres and Redis
 make api              # run the ingest API on :8080
+make worker           # run a proving worker (needs make setup-zk)
 ```
 
 Then submit a proof request:
@@ -62,18 +63,30 @@ Then submit a proof request:
 ```bash
 curl -X POST localhost:8080/v1/proofs -H 'content-type: application/json' -d '{
   "circuit_id": "membership",
-  "inputs": {"secret": "42", "leaf_index": "5",
-             "siblings": ["7","7","7","7","7","7","7","7","7","7",
-                          "7","7","7","7","7","7","7","7","7","7"]}
+  "inputs": {
+    "root": "0x089175ccc891f80d0f76bc5c6f7a239c2a78069ddf64478b68410c7d6b4c7320",
+    "secret": "42", "leaf_index": "5",
+    "siblings": ["7","7","7","7","7","7","7","7","7","7",
+                 "7","7","7","7","7","7","7","7","7","7"]
+  }
 }'
 ```
+
+Note what is *not* in there: the nullifier. Circuits derive it and publish it as
+the last public input, so a caller never has to compute a Pedersen hash to place
+an order. See [ADR-008](DECISIONS.md).
 
 It returns `202` with a job id. Submit it twice and the second response carries
 the same id with `"created": false` — the job is identified by the hash of its
 canonical inputs, so a retry after a timeout cannot create duplicate work.
 
-**Nothing proves that job yet.** The worker pool is Phase 3; today an accepted
-job stays `queued`.
+With `make worker` running, that job is leased, proved, and stored with its
+proof and public inputs within a few seconds. `make test-worker` runs the pool
+under load and under chaos: 100 jobs across 4 workers, and the same run with
+workers killed mid-proof.
+
+**Nothing settles that proof on chain yet.** The relayer is Phase 4; today a
+proved job stays `proved`.
 
 For the circuits and contracts, `make setup-zk` installs the proving toolchain
 at the exact pinned versions below; `make versions` reports what you have
@@ -104,7 +117,12 @@ properly in `docs/DESIGN.md` in Phase 6.
    queue. No leader election is required.
 3. **Resource bounding.** Every proving subprocess runs under a wall-clock
    timeout, a memory ceiling, and a CPU quota. Exceeding a bound is a normal,
-   recoverable failure that is metered, not a crash.
+   recoverable failure that is metered, not a crash. The limits are applied by
+   `ulimit` before `exec` rather than by `pre_exec`, so the workspace's
+   `unsafe_code = "forbid"` survives in the one service that runs untrusted
+   input. Peak memory is sampled from the kernel's own high-water mark, so the
+   ceilings can be checked against what proving actually costs rather than
+   against what it cost once.
 4. **Nonce and gas management.** The relayer is the single writer to its
    account nonce. Submissions are serialised, stuck transactions are bumped and
    replaced under a ceiling, and settlement is confirmed to N blocks to survive

@@ -70,7 +70,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (handle, signal) = shutdown();
     let signals = tokio::spawn(await_signals(handle));
 
-    let worker = Worker::new(store, config.worker.clone(), prover_config);
+    let mut worker = Worker::new(store.clone(), config.worker.clone(), prover_config);
+
+    // Optional by design. The spec requires Postgres to stay recoverable
+    // without Redis, so a worker that refused to start without a cache would
+    // contradict the invariant it was meant to serve.
+    if let Some(url) = &config.redis_url {
+        match dray_store::LeaseCache::connect(url).await {
+            Ok(leases) => {
+                // Redis runs without persistence here on purpose, so a restart
+                // leaves the mirror empty. Rebuilding from Postgres at start-up
+                // is the recovery path being exercised rather than assumed.
+                match leases.rebuild(&store).await {
+                    Ok(count) => tracing::info!(count, "lease mirror rebuilt from Postgres"),
+                    Err(err) => tracing::warn!(error = %err, "could not rebuild the lease mirror"),
+                }
+                worker = worker.with_lease_cache(leases);
+            }
+            Err(err) => tracing::warn!(
+                url = %url,
+                error = %err,
+                "could not reach Redis; continuing without the lease mirror"
+            ),
+        }
+    }
 
     // Serving metrics from the worker process rather than a sidecar keeps the
     // numbers and the thing they describe in the same lifetime: if the worker

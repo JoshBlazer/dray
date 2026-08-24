@@ -55,6 +55,12 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U dray -d dray"
           --health-interval 2s --health-timeout 3s --health-retries 15
+      redis:
+        image: redis:7.4-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s --health-timeout 3s --health-retries 15
     env:
       PGPASSWORD: dray
       PSQL: psql -h localhost -U dray -d dray -v ON_ERROR_STOP=1
@@ -115,9 +121,13 @@ jobs:
       # These are the tests that cannot run without a real database:
       # concurrent deduplication, transition serialisation, and the schema's
       # own check constraints. A required job, not an optional one.
+      # Includes the Redis lease mirror. Its most important test is that an
+      # unreachable Redis reports "unknown" rather than "free" — collapsing the
+      # two would hand every in-flight job to a second worker during an outage.
       - name: Store integration tests
         env:
           DATABASE_URL: postgres://dray:dray@localhost:5432/dray_test
+          REDIS_URL: redis://localhost:6379
         run: cargo test -p dray-store --features integration-tests
 
       # Drives the real router through real handlers against a real database.
@@ -193,6 +203,12 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U dray -d dray"
           --health-interval 2s --health-timeout 3s --health-retries 15
+      redis:
+        image: redis:7.4-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
       - uses: actions/checkout@v5
 
@@ -216,6 +232,7 @@ jobs:
       - name: Worker integration tests
         env:
           DATABASE_URL: postgres://dray:dray@localhost:5432/dray
+          REDIS_URL: redis://localhost:6379
         run: cargo test -p dray-worker --features integration-tests --test lease_loop
 
   compose:

@@ -94,6 +94,7 @@ clean: ## Stop dependencies and delete their volumes
 
 DATABASE_URL ?= postgres://dray:dray@localhost:5432/dray
 TEST_DATABASE_URL ?= postgres://dray:dray@localhost:5432/dray_test
+REDIS_URL ?= redis://localhost:6379
 
 seed: ## Register the circuits with their input schemas
 	@# Falls back to the Postgres container when psql is not installed locally,
@@ -111,8 +112,10 @@ api: ## Run the ingest API against the local dependencies
 
 worker: ## Run a proving worker against the local dependencies
 	@# The worker prepares circuit artefacts at start-up, so it needs the ZK
-	@# toolchain on PATH as well as a database.
-	PATH="$(ZK_PATH):$$PATH" DATABASE_URL="$(DATABASE_URL)" $(CARGO) run -p dray-worker
+	@# toolchain on PATH as well as a database. REDIS_URL is optional: without
+	@# it the worker simply does not mirror lease state.
+	PATH="$(ZK_PATH):$$PATH" DATABASE_URL="$(DATABASE_URL)" REDIS_URL="$(REDIS_URL)" \
+		$(CARGO) run -p dray-worker
 
 test-integration: ## Run the tests that need a live Postgres (requires make up)
 	@# A separate database, because the integration tests register a circuit per
@@ -121,7 +124,8 @@ test-integration: ## Run the tests that need a live Postgres (requires make up)
 	@$(COMPOSE) exec -T postgres psql -U dray -d dray -tAc \
 		"SELECT 1 FROM pg_database WHERE datname='dray_test'" | grep -q 1 || \
 		$(COMPOSE) exec -T postgres psql -U dray -d dray -c "CREATE DATABASE dray_test"
-	DATABASE_URL="$(TEST_DATABASE_URL)" $(CARGO) test -p dray-store --features integration-tests
+	DATABASE_URL="$(TEST_DATABASE_URL)" REDIS_URL="$(REDIS_URL)" \
+		$(CARGO) test -p dray-store --features integration-tests
 	DATABASE_URL="$(TEST_DATABASE_URL)" $(CARGO) test -p dray-api --features integration-tests
 
 test-proving: ## Run the worker tests that shell out to a real nargo and bb (requires make setup-zk)
@@ -135,7 +139,7 @@ test-worker: ## Run the whole-worker tests: load and chaos (needs make up and ma
 	@$(COMPOSE) exec -T postgres psql -U dray -d dray -tAc \
 		"SELECT 1 FROM pg_database WHERE datname='dray_test'" | grep -q 1 || \
 		$(COMPOSE) exec -T postgres psql -U dray -d dray -c "CREATE DATABASE dray_test"
-	PATH="$(ZK_PATH):$$PATH" DATABASE_URL="$(TEST_DATABASE_URL)" \
+	PATH="$(ZK_PATH):$$PATH" DATABASE_URL="$(TEST_DATABASE_URL)" REDIS_URL="$(REDIS_URL)" \
 		$(CARGO) test -p dray-worker --features integration-tests --test lease_loop
 
 reset-test-db: ## Drop and recreate the integration-test database

@@ -17,6 +17,9 @@ use crate::{backoff::Backoff, bounded::Bounds, worker::WorkerConfig};
 #[derive(Debug, Clone)]
 pub struct Config {
     pub database_url: String,
+    /// Redis URL for the lease mirror. `None` disables mirroring entirely —
+    /// the worker is fully functional without it, which is the point.
+    pub redis_url: Option<String>,
     pub max_db_connections: u32,
     /// Noir workspace to prepare artefacts from.
     pub circuits_dir: PathBuf,
@@ -140,6 +143,7 @@ impl Config {
         Ok(Self {
             database_url: read("DATABASE_URL")
                 .unwrap_or_else(|| "postgres://dray:dray@localhost:5432/dray".to_owned()),
+            redis_url: read("REDIS_URL"),
             max_db_connections: u32::try_from(parse_positive(
                 "DRAY_WORKER_DB_CONNECTIONS",
                 read("DRAY_WORKER_DB_CONNECTIONS").as_deref(),

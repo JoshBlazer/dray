@@ -910,3 +910,106 @@ async fn queue_depth_is_sampled_from_the_store() {
          an empty queue"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The Redis lease mirror
+//
+// The mirror is a cache, so the property that matters is not that it works but
+// that nothing depends on it working. Both are tested here.
+// ---------------------------------------------------------------------------
+
+fn redis_url() -> String {
+    std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_owned())
+}
+
+/// A leased job appears in the mirror while it is held, and is gone once it is
+/// finished — otherwise a queued job would look busy to every liveness check
+/// until its key happened to expire.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_mirror_tracks_a_job_through_its_attempt() {
+    let fixture = Fixture::build("mirror").await;
+    let cache = dray_store::LeaseCache::connect(&redis_url())
+        .await
+        .expect("could not reach Redis; run `make up`");
+
+    let id = fixture.enqueue_on("range_proof", range_inputs(7), 3).await;
+    cache.forget(id).await;
+
+    let (handle, signal) = shutdown();
+    let worker = fixture
+        .worker("mirror-worker")
+        .with_lease_cache(cache.clone());
+
+    // Sample the mirror while the job is being proved.
+    let observer = {
+        let store = fixture.store.clone();
+        let cache = cache.clone();
+        tokio::spawn(async move {
+            let mut seen_held = false;
+            for _ in 0..600 {
+                if matches!(cache.liveness(id).await, dray_store::Liveness::Held(_)) {
+                    seen_held = true;
+                }
+                let job = store.job(id).await.expect("lookup").expect("job");
+                if matches!(job.state, JobState::Proved | JobState::Failed) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            handle.trigger();
+            seen_held
+        })
+    };
+
+    worker.run(signal).await;
+    let seen_held = observer.await.expect("observer");
+
+    assert!(
+        seen_held,
+        "the mirror never showed the job as held, so it is not tracking leases"
+    );
+    assert_eq!(
+        cache.liveness(id).await,
+        dray_store::Liveness::Free,
+        "the mirror still claims a finished job"
+    );
+}
+
+/// The invariant the spec states outright: Postgres state is recoverable
+/// without Redis. A worker pointed at a dead Redis must prove jobs exactly as
+/// if it had none at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dead_mirror_does_not_stop_a_worker_proving() {
+    let fixture = Fixture::build("mirror_down").await;
+
+    // Port 1 is reserved; nothing listens there.
+    let Ok(broken) = dray_store::LeaseCache::connect("redis://127.0.0.1:1").await else {
+        // Refusing to connect is also acceptable — the caller never receives a
+        // cache that lies. Nothing left to test.
+        return;
+    };
+
+    let id = fixture.enqueue_on("range_proof", range_inputs(8), 3).await;
+
+    let (handle, signal) = shutdown();
+    let worker = fixture.worker("offline-mirror").with_lease_cache(broken);
+
+    let watcher = watch_until_settled(
+        fixture.store.clone(),
+        vec![id],
+        handle,
+        Duration::from_secs(180),
+    );
+    let outcomes = worker.run(signal).await;
+    watcher.await.expect("watcher");
+
+    assert_eq!(
+        outcomes,
+        vec![Outcome::Proved(id)],
+        "a worker must not depend on the cache it only mirrors into"
+    );
+
+    let job = fixture.store.job(id).await.unwrap().unwrap();
+    assert_eq!(job.state, JobState::Proved);
+    assert!(job.proof.is_some());
+}

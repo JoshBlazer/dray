@@ -1,7 +1,7 @@
 # Dray — Progress
 
-**Current phase:** 3 — Proof worker pool (in progress)
-**Last updated:** 2026-08-17
+**Current phase:** 3 — Proof worker pool (complete) → 4 — Relayer and settlement
+**Last updated:** 2026-08-24
 **Build status:** green — `make build`, `make test`, and `make lint` pass
 locally, and CI is green on a fresh clone across all five jobs.
 Repository: <https://github.com/JoshBlazer/dray>
@@ -13,7 +13,7 @@ Repository: <https://github.com/JoshBlazer/dray>
 | 0 | Foundations | done | yes | CI green on a fresh clone (run 31593551054). One caveat on `make up` — see below |
 | 1 | Circuits and on-chain verification | done | yes | `make e2e-circuits` proves both circuits and settles them on Anvil |
 | 2 | Ingest API and durable job store | done | yes | Verified in CI against real Postgres; not yet locally (no Docker) |
-| 3 | Proof worker pool | in progress | no | Leasing, resource bounds, and the proving pipeline done; lease loop, shutdown, metrics, and the chaos test remain |
+| 3 | Proof worker pool | done | yes | 100 jobs across 4 workers proved exactly once; the same run with workers killed throughout loses nothing |
 | 4 | Relayer and on-chain settlement | not started | no | |
 | 5 | Observability, operations, hardening | not started | no | |
 | 6 | Documentation, demo, release | not started | no | |
@@ -208,6 +208,7 @@ gcc 15.2.0, libc6-dev, and GNU Make 4.4.1. `make build`, `make test`, and
 | 2026-08-12 | Pedersen for hashing, not Poseidon | Poseidon is not in this Noir's stdlib and would mean an external dependency; `std::hash::pedersen_hash` is built in | Poseidon2 via an external package, adding a dependency to pin and audit for no benefit at this stage |
 | 2026-08-12 | `wouldSettle` catches verifier reverts and returns false | Found by a fuzz test: the generated verifier reverts rather than returning false, which made pre-flight useless for its one job | Letting the revert propagate, which would give the relayer an exception instead of an answer |
 | 2026-08-17 | ADR-008: circuits *return* the nullifier, so it is the last public input | Found while wiring the worker: a supplied nullifier is a Pedersen hash of private data, so requiring one means the client must run a proving stack to place an order. Also exposed that `membership`'s registered schema was missing `root`, making every submittable job unsolvable | Pedersen in Rust in the worker (two implementations to keep in exact agreement, diverging only after a proof has been paid for), or client-computed nullifiers (defeats the product) |
+| 2026-08-24 | ADR-009: Redis mirrors leases, and `Liveness::Unknown` is distinct from `Free` | Collapsing them would make a Redis outage look like every lease expiring at once, handing every in-flight job to a second worker — a cache outage becoming a fleet-wide stampede of duplicated proving | A two-valued liveness check (fails exactly when it is most needed), or making Redis authoritative for leases (contradicts the spec's recoverability invariant) |
 
 ## Open questions (for the human)
 
@@ -222,46 +223,56 @@ gcc 15.2.0, libc6-dev, and GNU Make 4.4.1. `make build`, `make test`, and
 
 ## Next actions
 
-Phase 3 — the proof worker pool — is under way. It is the phase the spec calls
-out as carrying the single most important engineering detail: resource
-bounding.
+Phase 3 is closed. Every task and both exit criteria are met, verified by
+execution rather than by inspection:
 
-Done:
+1. **Lease acquisition** with `SELECT ... FOR UPDATE SKIP LOCKED`, mirrored into
+   Redis. The attempt counter increments *at lease time*, because a worker
+   killed mid-proof never reports anything and a counter advanced only on
+   completion would let a poison job retry for ever.
+2. **Lease renewal** during long proofs, and a reaper in every worker. A killed
+   worker cannot return its own leases — that is what a lease is for — so
+   recovery has to come from whoever is still alive.
+3. **Resource-bounded subprocesses**: wall clock, `RLIMIT_AS`, `RLIMIT_CPU`,
+   applied through `sh`'s `ulimit` before `exec` so `unsafe_code = "forbid"`
+   survives. Scratch cleanup lives in `Drop`, so it runs on panic too.
+4. **Attempt accounting** with exponential backoff and jitter, held in Postgres
+   rather than in the worker that failed.
+5. **Graceful shutdown** on SIGTERM: stop leasing, finish within the grace
+   period or hand the job straight back.
+6. **Prometheus metrics** on `/metrics`, including peak memory measured from
+   `VmHWM` rather than guessed.
 
-1. **Lease acquisition** with `SELECT ... FOR UPDATE SKIP LOCKED`, plus
-   renewal and reaping. 12 store integration tests, headlined by twenty
-   workers racing for ten jobs. The attempt counter increments *at lease
-   time*, because a worker killed mid-proof never reports anything and a
-   counter advanced only on completion would let a poison job retry for ever.
-2. **Resource-bounded subprocess execution** — wall clock, `RLIMIT_AS`, and
-   `RLIMIT_CPU`, applied through `sh`'s `ulimit` before `exec` so the
-   workspace's `unsafe_code = "forbid"` survives. Scratch cleanup lives in
-   `Drop`, so it runs on panic too. 16 tests driving real failures rather than
-   mocks.
-3. **The proving pipeline** — `Prover.toml` from job inputs, `nargo execute`,
-   `bb prove -t evm`, both bounded. Each job gets a private copy of the circuit
-   package; `nargo` uses fixed paths inside the package directory, so a shared
-   one would let concurrent jobs overwrite each other's witnesses and produce a
-   proof recorded against the wrong inputs. 10 integration tests against the
-   real toolchain assert the worker reproduces the exact nullifiers
-   `e2e-circuits.sh` settles on chain.
-4. **Exponential backoff with jitter**, drawn from `[base/2, base]` so a shared
-   outage does not resynchronise the fleet on every subsequent attempt.
+**Exit criteria, both green in CI:**
 
-Remaining:
+- 100 jobs across 4 workers, every one proved exactly once — no loss, no
+  duplication, asserted against the transition log rather than against what the
+  workers reported.
+- The same 100-job run with workers killed mid-proof throughout. Every job still
+  proves exactly once.
 
-5. The lease loop itself: lease, heartbeat during the proof, record the result.
-   Losing a renewal must abandon the work rather than race the new owner.
-6. Graceful shutdown on SIGTERM: stop leasing, finish or cleanly abandon the
-   current job, release leases so the next worker need not wait out the TTL.
-7. Prometheus metrics: queue depth, lease age, proving duration, peak memory,
-   timeouts, OOMs, attempt distribution.
-8. Mirror lease TTL into Redis for fast liveness checks. Redis becomes
-   load-bearing for the first time — and must stay rebuildable from Postgres.
+### What Phase 3 found
 
-**Exit criterion:** a chaos test that randomly kills workers during a 100-job
-run, after which every job has settled exactly once in the store and none are
-lost.
+Three real defects, all caught by tests that drove real failures rather than
+mocks:
+
+- **A detached heartbeat loses jobs silently.** `tokio::spawn` detaches, so a
+  worker whose future was dropped mid-attempt left a task behind renewing the
+  lease for work that had stopped. The job looked permanently healthy to every
+  other worker — never expired, so never reaped, never retried, simply lost. It
+  was found sitting in `proving` with a lease five seconds in the future, 220
+  seconds after its worker died.
+- **Peak memory was never measured.** The field was documented as measured
+  "when `/usr/bin/time` was available" and was hardcoded to `None`, so the
+  memory ceiling derived from measurement in Phase 1 had nothing checking it was
+  still right.
+- **`f64::clamp` propagates NaN**, and `Duration::mul_f64` panics on it. A NaN
+  jitter draw would have panicked a worker while it was scheduling a retry,
+  failing far more jobs than whatever caused the retry.
+
+## Next: Phase 4 — relayer and on-chain settlement
+
+Two open questions need answers before it starts; both are in the section above.
 
 ### What Phase 3 has cost so far
 

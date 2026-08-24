@@ -30,6 +30,10 @@ use uuid::Uuid;
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
 /// Name of this component, as it appears in logs, metrics, and traces.
+pub mod leases;
+
+pub use leases::{LeaseCache, Liveness};
+
 pub const COMPONENT: &str = "dray-store";
 
 /// The columns [`Job`] is built from.
@@ -839,6 +843,48 @@ impl Store {
             Some("released on worker shutdown"),
         )
         .await
+    }
+
+    /// Every lease still live, with the time remaining on it.
+    ///
+    /// Exists so the Redis mirror can be rebuilt from the authoritative side
+    /// after Redis restarts — which it does, because this project runs Redis
+    /// without persistence on purpose, so the recovery path is exercised rather
+    /// than assumed.
+    ///
+    /// Leases already past their expiry are excluded: they belong to the
+    /// reaper, and writing them back into the mirror would advertise a holder
+    /// for a job that is about to be taken away from it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures.
+    pub async fn live_leases(
+        &self,
+    ) -> Result<Vec<(Uuid, String, std::time::Duration)>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, leased_by,
+                    extract(epoch FROM lease_expires_at - now())::double precision AS remaining
+             FROM jobs
+             WHERE state IN ('leased', 'proving')
+               AND leased_by IS NOT NULL
+               AND lease_expires_at > now()",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut leases = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let id: Uuid = row.try_get("id")?;
+            let worker_id: String = row.try_get("leased_by")?;
+            let remaining: Option<f64> = row.try_get("remaining")?;
+            leases.push((
+                id,
+                worker_id,
+                std::time::Duration::from_secs_f64(remaining.unwrap_or(0.0).max(0.0)),
+            ));
+        }
+        Ok(leases)
     }
 
     /// How long the longest-held lease has been held, in seconds.

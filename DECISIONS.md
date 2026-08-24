@@ -379,3 +379,73 @@ another.
   it is the clearest evidence so far for building the thin end-to-end slice
   early. A single job proved through the real worker in Phase 1 would have
   caught this before anything was built on top of it.
+
+---
+
+## ADR-009 — Redis mirrors leases; every operation on it is best-effort
+
+**Date:** 2026-08-24
+**Status:** accepted
+
+### Context
+
+The spec calls for the lease TTL to be mirrored into Redis for fast liveness
+checks, and separately states the invariant that **Postgres state is always
+recoverable without Redis**. Those two pull in opposite directions if the mirror
+is allowed to become load-bearing, which is the usual way a cache stops being a
+cache.
+
+The specific hazard is not that Redis goes down. It is what a caller does when
+it cannot get an answer. A liveness check has three possible outcomes and only
+two obvious ones:
+
+- someone holds this lease,
+- nobody holds this lease,
+- **I could not find out.**
+
+Collapse the third into the second and a Redis outage becomes indistinguishable
+from every lease in the system having expired simultaneously. Every in-flight
+job would be handed to a second worker, so a cache outage would turn into a
+fleet-wide stampede of duplicated proving — while the jobs were all still being
+proved perfectly well by their original owners.
+
+### Decision
+
+`LeaseCache` mirrors lease state into Redis under `dray:lease:<job_id>`, and
+every operation on it is infallible from the caller's point of view.
+
+- `record` and `forget` return nothing. A failure is logged at warning level and
+  the job proceeds. Postgres already holds the truth, written in the same
+  transaction as the state change.
+- `liveness` returns a three-valued `Liveness`, and `Unknown` is a distinct
+  variant from `Free`. `is_definitely_free` is the only thing that authorises
+  acting, and only `Free` satisfies it.
+- Connecting is the one fallible operation, because it happens at start-up where
+  an operator can act on it. A worker that cannot reach Redis logs and runs
+  without a mirror.
+- Redis expiry is *not* the mechanism that returns a job to the queue. The
+  reaper does that, from Postgres. If a key vanishes early the job is still
+  leased; if it lingers, the reaper still takes the job back on time.
+
+Compose runs Redis with persistence disabled, deliberately, so the recovery path
+is exercised in development instead of assumed. `LeaseCache::rebuild` is that
+path: after a restart the mirror is empty, and every lease Postgres still holds
+is written back with the time remaining on it. Expired leases are skipped —
+writing one back would advertise a holder for a job about to be taken off them.
+
+### Consequences
+
+- The mirror can be wrong, and nothing breaks when it is. It is a hint that
+  saves a Postgres round trip, never an authority.
+- `Liveness::Unknown` forces the caller to decide what to do about not knowing,
+  rather than letting the type quietly answer for it.
+- A worker with no `REDIS_URL` is fully functional. That is tested directly, by
+  pointing a worker at a dead Redis and requiring it to prove a job anyway.
+- Ordering is fixed on renewal: Postgres first, then the mirror. The other order
+  could leave the mirror advertising a lease Postgres had just refused to
+  extend.
+- Cost: one more dependency in the hot path, for a saving that is currently
+  theoretical — nothing yet asks a liveness question often enough to need it.
+  The mirror is built because the spec requires it and because the recovery path
+  is worth having in place before something depends on it, not because a
+  measurement showed Postgres was too slow.
