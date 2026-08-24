@@ -214,12 +214,16 @@ gcc 15.2.0, libc6-dev, and GNU Make 4.4.1. `make build`, `make test`, and
 
 - [x] ~~ADR-001 — confirm Rust for the API tier.~~ Answered 2026-08-11: Rust
       with axum. See ADR-001.
-- [ ] Target testnet: Base Sepolia or Ethereum Sepolia? *(Needed by Phase 4.)*
+- [x] Target testnet: Base Sepolia or Ethereum Sepolia? **Base Sepolia**
+      (ADR-010). ~2s blocks, so a confirmation depth of N is a short enough wait
+      to test against the real chain rather than only against Anvil.
 - [x] ~~Is proof batching in scope for v1.0?~~ Answered 2026-08-12: deferred to
       v1.1. See ADR-004. `DraySettlement.sol` exposes single-proof settlement
       only.
-- [ ] Single trusted relayer operator, or a small permissioned set? *(Needed by
-      Phase 4.)*
+- [x] Single trusted relayer operator, or a small permissioned set? **A small
+      permissioned set** (ADR-011). Each relayer holds its own key, so each is
+      the single writer to its own nonce; they share the `proved` queue through
+      the same leasing machinery the workers use.
 
 ## Next actions
 

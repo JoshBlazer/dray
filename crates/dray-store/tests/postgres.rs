@@ -1356,3 +1356,373 @@ async fn lease_age_reports_the_longest_held_lease() {
         "an implausible age suggests the wrong clock: {age:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The relayer's queue
+//
+// Dray runs a permissioned set of relayers (ADR-011), so `proved` jobs are
+// leased for exactly the reason `queued` ones are: two relayers submitting the
+// same proof both pay, and one of them pays to be rejected.
+// ---------------------------------------------------------------------------
+
+/// Move a job all the way to `proved`, so the relayer's queue has something in
+/// it. Returns the job id.
+async fn proved_job(store: &Store) -> uuid::Uuid {
+    let ids = seed_jobs(store, 1).await;
+    let id = ids[0];
+
+    store
+        .lease_next("worker-1", Duration::from_secs(60))
+        .await
+        .expect("lease")
+        .expect("a job to lease");
+    store
+        .begin_proving(id, "worker-1")
+        .await
+        .expect("begin proving");
+    store
+        .record_proof(
+            id,
+            "worker-1",
+            b"proof-bytes",
+            &[7_u8; 64],
+            2500,
+            Some(43_008),
+        )
+        .await
+        .expect("record proof");
+
+    id
+}
+
+#[tokio::test]
+async fn a_proved_job_can_be_leased_for_submission() {
+    let store = isolated_store("submit_lease").await;
+    let id = proved_job(&store).await;
+
+    let leased = store
+        .lease_next_proved("relayer-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("a proved job should be available to submit");
+
+    assert_eq!(leased.id, id);
+    assert_eq!(leased.state, JobState::Submitting);
+    assert_eq!(leased.leased_by.as_deref(), Some("relayer-1"));
+    assert_eq!(leased.submission_attempts, 1);
+    assert!(
+        leased.proof.is_some(),
+        "the relayer needs the proof it is submitting"
+    );
+}
+
+/// The point of leasing the relayer queue at all.
+#[tokio::test]
+async fn two_relayers_never_take_the_same_proof() {
+    let store = isolated_store("submit_race").await;
+    proved_job(&store).await;
+
+    let first = store
+        .lease_next_proved("relayer-1", Duration::from_secs(60))
+        .await
+        .unwrap();
+    let second = store
+        .lease_next_proved("relayer-2", Duration::from_secs(60))
+        .await
+        .unwrap();
+
+    assert!(first.is_some(), "the first relayer should get the job");
+    assert!(
+        second.is_none(),
+        "the second relayer must not also take it — it would pay gas to be \
+         rejected by the nullifier set"
+    );
+}
+
+/// Proving attempts and submission attempts are separate budgets. A job that
+/// needed two tries to prove must arrive at the relayer with its submission
+/// budget intact, or a single RPC blip could discard a perfectly valid proof.
+#[tokio::test]
+async fn submission_attempts_are_counted_separately_from_proving_attempts() {
+    let store = isolated_store("submit_budget").await;
+    let ids = seed_jobs(&store, 1).await;
+    let id = ids[0];
+
+    // Two failed proving attempts, then a successful one.
+    for _ in 0..2 {
+        store
+            .lease_next("worker-1", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .record_failure(
+                id,
+                "worker-1",
+                dray_core::FailureKind::Transient,
+                "transient",
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .lease_next("worker-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    store.begin_proving(id, "worker-1").await.unwrap();
+    store
+        .record_proof(id, "worker-1", b"proof", &[1_u8; 64], 2500, None)
+        .await
+        .unwrap();
+
+    let leased = store
+        .lease_next_proved("relayer-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("should still be submittable");
+
+    assert_eq!(leased.attempts, 3, "three proving attempts were made");
+    assert_eq!(
+        leased.submission_attempts, 1,
+        "the submission budget must start fresh"
+    );
+
+    // And a transient submission failure returns it, rather than exhausting it
+    // on a budget that proving had already spent.
+    let after = store
+        .record_submission_failure(
+            id,
+            "relayer-1",
+            dray_core::FailureKind::Transient,
+            "rpc timeout",
+            Some(Duration::from_secs(30)),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        after.state,
+        JobState::Proved,
+        "a transient submission failure must keep the proof, not discard it"
+    );
+    assert!(after.retry_after.is_some(), "and back off before retrying");
+}
+
+#[tokio::test]
+async fn a_submission_is_recorded_before_it_is_confirmed() {
+    let store = isolated_store("submit_record").await;
+    let id = proved_job(&store).await;
+    store
+        .lease_next_proved("relayer-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let tx_hash = [0xAB_u8; 32];
+    let nullifier = [0xCD_u8; 32];
+    store
+        .record_submission(id, &tx_hash, &nullifier)
+        .await
+        .unwrap();
+
+    let job = store.job(id).await.unwrap().unwrap();
+    assert_eq!(
+        job.state,
+        JobState::Submitting,
+        "broadcasting is not settling; only confirmation moves the job on"
+    );
+
+    let settlement = store
+        .latest_settlement(id)
+        .await
+        .unwrap()
+        .expect("the broadcast should be on record");
+    assert_eq!(settlement.tx_hash, tx_hash);
+    assert_eq!(settlement.confirmations, 0);
+    assert!(settlement.block_number.is_none());
+
+    // It is visible to the confirmation tracker.
+    let pending = store.settlements_awaiting_confirmation().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].0, id);
+}
+
+#[tokio::test]
+async fn confirming_settles_the_job_and_records_what_it_cost() {
+    let store = isolated_store("submit_confirm").await;
+    let id = proved_job(&store).await;
+    store
+        .lease_next_proved("relayer-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let tx_hash = [0x11_u8; 32];
+    store
+        .record_submission(id, &tx_hash, &[0x22_u8; 32])
+        .await
+        .unwrap();
+
+    let job = store
+        .confirm_settlement(
+            id,
+            "relayer-1",
+            &tx_hash,
+            &dray_store::Receipt {
+                block_number: 1_234_567,
+                confirmations: 5,
+                gas_used: Some(287_431),
+                // Larger than an i64, which is why gas price is text.
+                effective_gas_price: Some("100000000000000000000000".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(job.state, JobState::Settled);
+    assert!(
+        job.leased_by.is_none(),
+        "a settled job is nobody's work in progress"
+    );
+
+    let settlement = store.latest_settlement(id).await.unwrap().unwrap();
+    assert_eq!(settlement.block_number, Some(1_234_567));
+    assert_eq!(settlement.confirmations, 5);
+    assert_eq!(settlement.gas_used, Some(287_431));
+    assert_eq!(
+        settlement.effective_gas_price.as_deref(),
+        Some("100000000000000000000000"),
+        "a 256-bit gas price must survive the round trip"
+    );
+
+    assert!(
+        store
+            .settlements_awaiting_confirmation()
+            .await
+            .unwrap()
+            .is_empty(),
+        "a settled job is no longer awaiting confirmation"
+    );
+}
+
+/// `settled` is deliberately not terminal. A reorg returns the job to `proved`
+/// — the proof is still valid, only its place on the chain was lost.
+#[tokio::test]
+async fn a_reorg_unwinds_a_settlement_without_discarding_the_proof() {
+    let store = isolated_store("submit_reorg").await;
+    let id = proved_job(&store).await;
+    store
+        .lease_next_proved("relayer-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let tx_hash = [0x33_u8; 32];
+    store
+        .record_submission(id, &tx_hash, &[0x44_u8; 32])
+        .await
+        .unwrap();
+    store
+        .confirm_settlement(
+            id,
+            "relayer-1",
+            &tx_hash,
+            &dray_store::Receipt {
+                block_number: 900,
+                confirmations: 3,
+                gas_used: Some(100_000),
+                effective_gas_price: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let job = store.record_reorg(id, "relayer-1", &tx_hash).await.unwrap();
+
+    assert_eq!(job.state, JobState::Proved);
+    assert!(
+        job.proof.is_some(),
+        "the proof survives a reorg; only the settlement is lost"
+    );
+
+    let settlement = store.latest_settlement(id).await.unwrap().unwrap();
+    assert!(
+        settlement.reorged_at.is_some(),
+        "the settlement row is kept and stamped, not deleted — 'settled then \
+         un-settled' is the history worth reading back"
+    );
+    assert_eq!(settlement.confirmations, 0);
+
+    // And it is submittable again.
+    let released = store
+        .lease_next_proved("relayer-2", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("a reorged job must go back on the relayer queue");
+    assert_eq!(released.id, id);
+    assert_eq!(released.submission_attempts, 2);
+}
+
+/// A relayer that dies mid-submission must return the job to `proved`, never to
+/// `queued`. Re-proving a job whose proof already exists would throw away
+/// seconds of CPU for an RPC timeout.
+#[tokio::test]
+async fn reaping_a_dead_relayer_returns_the_job_to_the_submit_queue() {
+    let store = isolated_store("submit_reap").await;
+    let id = proved_job(&store).await;
+
+    store
+        .lease_next_proved("doomed-relayer", Duration::from_secs(0))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let reaped = store.reap_expired_leases("reaper").await.unwrap();
+    assert_eq!(reaped, vec![id]);
+
+    let job = store.job(id).await.unwrap().unwrap();
+    assert_eq!(
+        job.state,
+        JobState::Proved,
+        "a dead relayer must not cost the job its proof"
+    );
+    assert!(job.proof.is_some());
+    assert_eq!(job.attempts, 1, "no proving attempt was spent");
+    assert_eq!(job.submission_attempts, 1, "a submission attempt was");
+
+    let history = store.transitions(id).await.unwrap();
+    assert!(
+        history
+            .iter()
+            .any(|(from, _, to)| *from == JobState::Submitting && *to == JobState::Proved),
+        "the log should show the submission being returned: {history:?}"
+    );
+}
+
+/// The submission budget bounds relayer churn the same way the proving budget
+/// bounds worker churn.
+#[tokio::test]
+async fn a_job_that_kills_every_relayer_eventually_fails() {
+    let store = isolated_store("submit_exhaust").await;
+    let id = proved_job(&store).await;
+
+    for expected in 1..=3 {
+        let leased = store
+            .lease_next_proved("doomed-relayer", Duration::from_secs(0))
+            .await
+            .unwrap()
+            .expect("should still be submittable");
+        assert_eq!(leased.submission_attempts, expected);
+
+        store.reap_expired_leases("reaper").await.unwrap();
+    }
+
+    let job = store.job(id).await.unwrap().unwrap();
+    assert_eq!(
+        job.state,
+        JobState::Failed,
+        "a proof nobody can submit must stop being handed out"
+    );
+}

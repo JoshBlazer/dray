@@ -449,3 +449,92 @@ writing one back would advertise a holder for a job about to be taken off them.
   The mirror is built because the spec requires it and because the recovery path
   is worth having in place before something depends on it, not because a
   measurement showed Postgres was too slow.
+
+---
+
+## ADR-010 — Base Sepolia as the target testnet
+
+**Date:** 2026-08-24
+**Status:** accepted
+
+### Context
+
+The spec left the choice between Base Sepolia and Ethereum Sepolia open for the
+human to make. It was deferred until Phase 4 because nothing before it touched a
+public chain.
+
+### Decision
+
+Base Sepolia. Decided by the human.
+
+### Consequences
+
+- Base is an OP Stack L2, so blocks arrive roughly every 2 seconds against
+  Ethereum's 12. Confirmation depth is a count of blocks, so the same N is a
+  much shorter wall-clock wait — which makes the confirmation-tracking tests
+  practical to run for real rather than only against Anvil.
+- Gas is cheap enough that the batching deferred in ADR-004 stays deferred
+  without embarrassment. The gas saving batching would buy is worth measuring
+  in v1.1, but it is not what makes this system interesting.
+- L2s reorg differently from L1: sequencer-driven reordering is rare but the
+  chain is not final until it is proven on L1. Treating `settled` as
+  non-terminal was already the design (see the state machine); on an L2 it is
+  not a theoretical nicety.
+- The verifier contract is EVM-equivalent bytecode, so nothing about the
+  circuits or the settlement contract changes. Only the RPC endpoint, chain id,
+  and gas policy differ.
+
+---
+
+## ADR-011 — A small permissioned set of relayers, not a single operator
+
+**Date:** 2026-08-24
+**Status:** accepted
+
+### Context
+
+The spec offered "a single trusted operator (simpler, honest)" or "a small
+permissioned set (more impressive, considerably more work)". Decided by the
+human: the permissioned set.
+
+`DraySettlement` already carries the on-chain half — an `isRelayer` mapping and
+`setRelayer`, both owner-gated — so authorisation itself needs no contract
+change. The work is entirely off chain, and it is not where it first appears to
+be.
+
+### Decision
+
+Several relayer processes, each holding **its own key and therefore its own
+nonce**, all authorised by the settlement contract.
+
+The hard part is not authorisation. It is that N relayers share one queue of
+`proved` jobs. Two relayers picking up the same job would both submit, and both
+would pay: the first settles, the second reverts on the nullifier set having
+already consumed it. Correct, because the contract is the second line of
+defence — but it burns real gas to discover something the database already knew.
+
+So relayers lease their work exactly as workers do, through the same
+`FOR UPDATE SKIP LOCKED` machinery, with the queue being `proved` jobs rather
+than `queued` ones. Leasing is what keeps each job to one relayer; the nullifier
+set stays the backstop it was designed to be rather than the primary mechanism.
+
+Nonce management is unaffected, and this is the point of one key per process:
+each relayer is the single writer to its own account's nonce. Sharing one key
+across processes would need distributed nonce allocation, which is the genuinely
+hard version of this problem and buys nothing here.
+
+### Consequences
+
+- One relayer can be lost without settlement stopping, which a single operator
+  cannot offer. The leases of a dead relayer expire and its jobs return to the
+  `proved` queue, reusing the reaper that already exists.
+- Each relayer needs its own funded account on Base Sepolia, and each must be
+  registered with `setRelayer`. Adding one is two operations, not a deploy.
+- Gas accounting becomes per-relayer. `settlements` records the transaction, so
+  attribution comes from the chain rather than from a separate ledger.
+- Cost, stated plainly: leasing a second job class, a second reaper path, and
+  tests for two relayers contending. That is the "considerably more work" the
+  spec warned about, and it is real.
+- What this is *not*: decentralisation. The owner still controls the relayer
+  set, and the contract says so in its own documentation. A permissioned set is
+  redundancy, not trustlessness, and claiming otherwise would be dishonest.

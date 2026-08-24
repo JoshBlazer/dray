@@ -44,8 +44,8 @@ pub const COMPONENT: &str = "dray-store";
 /// And an explicit list means adding a column to the table cannot silently
 /// change what this code reads.
 const JOB_COLUMNS: &str = "id, circuit_id, job_hash, idempotency_key, inputs, \
-     state::text AS state, attempts, max_attempts, last_error, leased_by, proof, \
-     retry_after, created_at, updated_at";
+     state::text AS state, attempts, max_attempts, submission_attempts, last_error, \
+     leased_by, proof, retry_after, created_at, updated_at";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -84,6 +84,40 @@ pub struct Circuit {
     pub enabled: bool,
 }
 
+/// What the chain reported about a mined transaction.
+///
+/// Grouped rather than passed as loose arguments because these four always
+/// travel together — they are one receipt, read in one call — and because a
+/// caller that transposed `block_number` and `gas_used` would produce a row
+/// that is wrong in a way nothing would notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Receipt {
+    pub block_number: i64,
+    pub confirmations: i32,
+    pub gas_used: Option<i64>,
+    /// Decimal string: gas prices are up to 256 bits, so an integer type would
+    /// silently round what a transaction actually cost.
+    pub effective_gas_price: Option<String>,
+}
+
+/// A recorded on-chain settlement.
+#[derive(Debug, Clone)]
+pub struct Settlement {
+    pub job_id: Uuid,
+    pub tx_hash: Vec<u8>,
+    pub nullifier: Vec<u8>,
+    pub block_number: Option<i64>,
+    pub confirmations: i32,
+    pub gas_used: Option<i64>,
+    /// Kept as text: gas prices are up to 256 bits and would not survive an
+    /// i64, and rounding the number a transaction actually cost would make the
+    /// gas figures in the README wrong.
+    pub effective_gas_price: Option<String>,
+    /// Set when a reorg removed this settlement. The row is kept rather than
+    /// deleted, so "settled then un-settled" stays readable.
+    pub reorged_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// A proof request and everything known about its progress.
 #[derive(Debug, Clone)]
 pub struct Job {
@@ -95,6 +129,13 @@ pub struct Job {
     pub state: JobState,
     pub attempts: i32,
     pub max_attempts: i32,
+    /// Times a relayer has taken this job for submission.
+    ///
+    /// Separate from [`Job::attempts`] on purpose: proving and submitting are
+    /// different work with different failure modes, and a shared counter would
+    /// let a job that needed two tries to prove exhaust itself on one RPC blip
+    /// — discarding a valid proof that had simply been unlucky with the chain.
+    pub submission_attempts: i32,
     pub last_error: Option<String>,
     pub leased_by: Option<String>,
     pub proof: Option<Vec<u8>>,
@@ -118,6 +159,7 @@ impl Job {
                 .map_err(|e| StoreError::Corrupt(format!("job.state: {e}")))?,
             attempts: row.try_get("attempts")?,
             max_attempts: row.try_get("max_attempts")?,
+            submission_attempts: row.try_get("submission_attempts")?,
             last_error: row.try_get("last_error")?,
             leased_by: row.try_get("leased_by")?,
             proof: row.try_get("proof")?,
@@ -554,8 +596,9 @@ impl Store {
         let mut tx = self.pool.begin().await?;
 
         let expired = sqlx::query(
-            "SELECT id, state::text AS state, attempts, max_attempts FROM jobs
-             WHERE state IN ('leased', 'proving')
+            "SELECT id, state::text AS state, attempts, max_attempts, submission_attempts
+             FROM jobs
+             WHERE state IN ('leased', 'proving', 'submitting')
                AND lease_expires_at < now()
              FOR UPDATE SKIP LOCKED",
         )
@@ -568,24 +611,42 @@ impl Store {
             let state_name: String = row.try_get("state")?;
             let from = JobState::from_str(&state_name)
                 .map_err(|e| StoreError::Corrupt(format!("job.state: {e}")))?;
-            let attempts: i32 = row.try_get("attempts")?;
             let max_attempts: i32 = row.try_get("max_attempts")?;
+
+            // Which budget applies depends on what the dead process was doing.
+            // A relayer that died mid-submission has not spent a proving
+            // attempt, and charging it one would eventually discard a valid
+            // proof for a reason that has nothing to do with proving.
+            let attempts: i32 = if from == JobState::Submitting {
+                row.try_get("submission_attempts")?
+            } else {
+                row.try_get("attempts")?
+            };
 
             // An expired lease is a transient failure — but it still spends an
             // attempt, and the budget still has to be honoured. Without this, a
-            // job whose input kills whatever worker touches it would be handed
-            // out for ever, taking down one worker after another. The attempt
-            // counter exists precisely to bound that, and it only bounds
-            // anything if the reaper consults it.
+            // job whose input kills whatever process touches it would be handed
+            // out for ever, taking down one after another. The attempt counter
+            // exists precisely to bound that, and it only bounds anything if
+            // the reaper consults it.
             let event = dray_core::classify_failure(
                 dray_core::FailureKind::Transient,
                 attempts.max(0).unsigned_abs(),
                 max_attempts.max(1).unsigned_abs(),
             );
             let event = if event == JobEvent::RetryScheduled {
-                // The lease expiring *is* the event; `retry_scheduled` would
-                // claim a decision this code did not make.
-                JobEvent::LeaseExpired
+                // `Submitting` has no `LeaseExpired` transition, and rightly
+                // so: a submission that lost its lease must go back to
+                // `proved`, not to `queued`. Throwing away a finished proof
+                // because an RPC call timed out would be the single most
+                // wasteful thing this system could do.
+                if from == JobState::Submitting {
+                    JobEvent::RetryScheduled
+                } else {
+                    // Elsewhere the lease expiring *is* the event;
+                    // `retry_scheduled` would claim a decision not made here.
+                    JobEvent::LeaseExpired
+                }
             } else {
                 event
             };
@@ -843,6 +904,365 @@ impl Store {
             Some("released on worker shutdown"),
         )
         .await
+    }
+
+    // -----------------------------------------------------------------------
+    // Settlement
+    // -----------------------------------------------------------------------
+
+    /// Take the oldest job waiting to go on chain, and lease it for submission.
+    ///
+    /// The relayer's queue is `proved` jobs, and it is leased for exactly the
+    /// reason the proving queue is. Dray runs a permissioned *set* of relayers
+    /// (ADR-011), so without a lease two of them would submit the same proof:
+    /// the first would settle, the second would revert on a nullifier the
+    /// contract had already consumed. Correct, but it burns real gas to
+    /// discover something the database already knew. Leasing keeps the
+    /// nullifier set the backstop it was designed to be.
+    ///
+    /// `submission_attempts` increments here rather than on completion, for the
+    /// same reason `attempts` does: a relayer killed after broadcasting but
+    /// before recording never reports anything.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures.
+    pub async fn lease_next_proved(
+        &self,
+        relayer_id: &str,
+        lease_ttl: std::time::Duration,
+    ) -> Result<Option<Job>, StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        let candidate = sqlx::query(
+            "SELECT id FROM jobs
+             WHERE state = 'proved'
+               AND (retry_after IS NULL OR retry_after <= now())
+             ORDER BY created_at
+             FOR UPDATE SKIP LOCKED
+             LIMIT 1",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(row) = candidate else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let id: Uuid = row.try_get("id")?;
+
+        let next = transition(JobState::Proved, JobEvent::SubmissionStarted)?;
+
+        let update = format!(
+            "UPDATE jobs SET
+                 state               = $2::job_state,
+                 leased_by           = $3,
+                 lease_expires_at    = now() + make_interval(secs => $4),
+                 submission_attempts = submission_attempts + 1,
+                 retry_after         = NULL
+             WHERE id = $1
+             RETURNING {JOB_COLUMNS}"
+        );
+        let leased = sqlx::query(&update)
+            .bind(id)
+            .bind(next.as_str())
+            .bind(relayer_id)
+            .bind(lease_ttl.as_secs_f64())
+            .fetch_one(&mut *tx)
+            .await?;
+
+        let job = Job::from_row(&leased)?;
+
+        sqlx::query(
+            "INSERT INTO job_transitions (job_id, from_state, event, to_state, actor)
+             VALUES ($1, 'proved'::job_state, 'submission_started'::job_event, \
+                     $2::job_state, $3)",
+        )
+        .bind(id)
+        .bind(next.as_str())
+        .bind(relayer_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(Some(job))
+    }
+
+    /// Record that a transaction carrying this proof has been broadcast.
+    ///
+    /// Written *before* the transaction is confirmed, and deliberately so. A
+    /// relayer that broadcast and then died would otherwise leave a transaction
+    /// in flight that nothing knew about, and the next relayer would submit a
+    /// second one — paying twice to have one of them revert. The row is the
+    /// record that a nonce has already been spent on this job.
+    ///
+    /// The job stays `submitting`; only confirmation moves it on.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures.
+    pub async fn record_submission(
+        &self,
+        id: Uuid,
+        tx_hash: &[u8],
+        nullifier: &[u8],
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO settlements (job_id, tx_hash, nullifier)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(id)
+        .bind(tx_hash)
+        .bind(nullifier)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Mark a settlement confirmed to the required depth, and the job settled.
+    ///
+    /// Both happen in one transaction: a `settled` job whose settlement row
+    /// says otherwise is a discrepancy nothing would ever reconcile.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures and illegal transitions.
+    pub async fn confirm_settlement(
+        &self,
+        id: Uuid,
+        relayer_id: &str,
+        tx_hash: &[u8],
+        receipt: &Receipt,
+    ) -> Result<Job, StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            "UPDATE settlements SET
+                 block_number        = $3,
+                 confirmations       = $4,
+                 gas_used            = $5,
+                 effective_gas_price = $6::numeric,
+                 reorged_at          = NULL,
+                 updated_at          = now()
+             WHERE job_id = $1 AND tx_hash = $2",
+        )
+        .bind(id)
+        .bind(tx_hash)
+        .bind(receipt.block_number)
+        .bind(receipt.confirmations)
+        .bind(receipt.gas_used)
+        .bind(receipt.effective_gas_price.as_deref())
+        .execute(&mut *tx)
+        .await?;
+
+        let job = Self::apply_event_in_tx(
+            &mut tx,
+            id,
+            JobEvent::SettlementConfirmed,
+            Some(relayer_id),
+            None,
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(job)
+    }
+
+    /// Unwind a settlement that a reorg removed.
+    ///
+    /// The settlement row is kept and stamped rather than deleted: "this
+    /// settled and then un-settled" is exactly the history worth being able to
+    /// read back, and deleting it would make a resubmission look like the first
+    /// attempt.
+    ///
+    /// The job returns to `proved`, because the proof is still perfectly valid
+    /// — only its place on the chain was lost.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures and illegal transitions.
+    pub async fn record_reorg(
+        &self,
+        id: Uuid,
+        relayer_id: &str,
+        tx_hash: &[u8],
+    ) -> Result<Job, StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            "UPDATE settlements SET
+                 reorged_at    = now(),
+                 confirmations = 0,
+                 updated_at    = now()
+             WHERE job_id = $1 AND tx_hash = $2",
+        )
+        .bind(id)
+        .bind(tx_hash)
+        .execute(&mut *tx)
+        .await?;
+
+        let job = Self::apply_event_in_tx(
+            &mut tx,
+            id,
+            JobEvent::Reorged,
+            Some(relayer_id),
+            Some("settlement removed by a chain reorganisation"),
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(job)
+    }
+
+    /// Settlements that have been broadcast but are not yet confirmed to depth.
+    ///
+    /// Returns `(job_id, tx_hash, nullifier)`. Feeds the confirmation tracker.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures.
+    pub async fn settlements_awaiting_confirmation(
+        &self,
+    ) -> Result<Vec<(Uuid, Vec<u8>, Vec<u8>)>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT s.job_id, s.tx_hash, s.nullifier
+             FROM settlements s
+             JOIN jobs j ON j.id = s.job_id
+             WHERE j.state = 'submitting'
+               AND s.reorged_at IS NULL
+             ORDER BY s.created_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut pending = Vec::with_capacity(rows.len());
+        for row in &rows {
+            pending.push((
+                row.try_get("job_id")?,
+                row.try_get("tx_hash")?,
+                row.try_get("nullifier")?,
+            ));
+        }
+        Ok(pending)
+    }
+
+    /// The most recent settlement recorded for a job, if any.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures.
+    pub async fn latest_settlement(&self, id: Uuid) -> Result<Option<Settlement>, StoreError> {
+        let row = sqlx::query(
+            "SELECT job_id, tx_hash, nullifier, block_number, confirmations,
+                    gas_used, effective_gas_price::text AS effective_gas_price, reorged_at
+             FROM settlements
+             WHERE job_id = $1
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else { return Ok(None) };
+
+        Ok(Some(Settlement {
+            job_id: row.try_get("job_id")?,
+            tx_hash: row.try_get("tx_hash")?,
+            nullifier: row.try_get("nullifier")?,
+            block_number: row.try_get("block_number")?,
+            confirmations: row.try_get("confirmations")?,
+            gas_used: row.try_get("gas_used")?,
+            effective_gas_price: row.try_get("effective_gas_price")?,
+            reorged_at: row.try_get("reorged_at")?,
+        }))
+    }
+
+    /// Record a failed submission attempt.
+    ///
+    /// Distinct from [`Store::record_failure`] because it spends the
+    /// *submission* budget. A transient failure returns the job to `proved`,
+    /// keeping the proof; only an exhausted or permanent failure discards it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures and illegal transitions.
+    pub async fn record_submission_failure(
+        &self,
+        id: Uuid,
+        relayer_id: &str,
+        kind: dray_core::FailureKind,
+        error: &str,
+        retry_in: Option<std::time::Duration>,
+    ) -> Result<Job, StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        let current = sqlx::query(
+            "SELECT state::text AS state, submission_attempts, max_attempts
+             FROM jobs WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::JobNotFound(id))?;
+
+        let state_name: String = current.try_get("state")?;
+        let from = JobState::from_str(&state_name)
+            .map_err(|e| StoreError::Corrupt(format!("job.state: {e}")))?;
+        let attempts: i32 = current.try_get("submission_attempts")?;
+        let max_attempts: i32 = current.try_get("max_attempts")?;
+
+        let event = dray_core::classify_failure(
+            kind,
+            attempts.max(0).unsigned_abs(),
+            max_attempts.max(1).unsigned_abs(),
+        );
+        let next = transition(from, event)?;
+
+        // A delay is only meaningful for a job going back on a queue.
+        let retry_seconds = if next == JobState::Proved {
+            retry_in.map(|d| d.as_secs_f64())
+        } else {
+            None
+        };
+
+        let update = format!(
+            "UPDATE jobs SET
+                 state            = $2::job_state,
+                 last_error       = $3,
+                 leased_by        = NULL,
+                 lease_expires_at = NULL,
+                 retry_after      = CASE
+                     WHEN $4::double precision IS NULL THEN NULL
+                     ELSE now() + make_interval(secs => $4::double precision)
+                 END
+             WHERE id = $1
+             RETURNING {JOB_COLUMNS}"
+        );
+        let updated = sqlx::query(&update)
+            .bind(id)
+            .bind(next.as_str())
+            .bind(error)
+            .bind(retry_seconds)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        sqlx::query(
+            "INSERT INTO job_transitions (job_id, from_state, event, to_state, actor, detail)
+             VALUES ($1, $2::job_state, $3::job_event, $4::job_state, $5, $6)",
+        )
+        .bind(id)
+        .bind(from.as_str())
+        .bind(event.as_str())
+        .bind(next.as_str())
+        .bind(relayer_id)
+        .bind(error)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Job::from_row(&updated)
     }
 
     /// Every lease still live, with the time remaining on it.
