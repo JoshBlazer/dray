@@ -434,6 +434,7 @@ dependencies = [
 name = "dray-worker"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "chrono",
  "dray-core",
  "dray-store",

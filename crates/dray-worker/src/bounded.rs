@@ -33,14 +33,37 @@
 //! need either root or a systemd delegation this project does not assume.
 //! Bounds should therefore be set with headroom over measured peak RSS, and
 //! [`Bounds::for_proving`] does exactly that.
+//!
+//! # Measuring what was actually used
+//!
+//! Enforcing a ceiling is only half of it. Without knowing what a normal proof
+//! *costs*, the ceiling is a guess that nobody can tell is wrong until it
+//! starts failing healthy jobs, so peak resident set size is reported alongside
+//! every run.
+//!
+//! It is sampled from `/proc/<pid>/status`, specifically `VmHWM` — the kernel's
+//! own high-water mark, which is monotonic, so polling it cannot overstate the
+//! peak and misses only a spike in the final sampling interval.
+//!
+//! The obvious alternative, wrapping the command in `/usr/bin/time -f %M`, was
+//! rejected: it reintroduces the intermediate process that `exec` exists to
+//! avoid. Killing the child on the wall clock would then kill `time` and orphan
+//! the proof it was timing, which trades a missing measurement for a runaway
+//! process.
 
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use tokio::io::AsyncReadExt;
+
+use crate::task::TaskGuard;
 
 /// Limits applied to a single subprocess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,8 +175,9 @@ pub struct Completed {
     pub stdout: String,
     pub stderr: String,
     pub duration: Duration,
-    /// Peak resident set size in kilobytes, when `/usr/bin/time` was available
-    /// to measure it.
+    /// Peak resident set size in kilobytes, sampled from `/proc` while the
+    /// process ran. `None` where `/proc` is unavailable, or where the process
+    /// was too short-lived to be sampled even once.
     pub peak_memory_kb: Option<u64>,
 }
 
@@ -245,6 +269,15 @@ pub async fn run(
         .spawn()
         .map_err(|e| BoundedError::Spawn(e.to_string()))?;
 
+    // `exec` in the script means this pid *is* the target process once the
+    // shell has replaced itself, so sampling it measures the real work. Early
+    // samples catch the shell, which is negligible and only ever lowers the
+    // maximum.
+    let peak = Arc::new(AtomicU64::new(0));
+    let _sampler = child
+        .id()
+        .map(|pid| TaskGuard::spawn(sample_peak_rss(pid, Arc::clone(&peak))));
+
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
 
@@ -279,7 +312,10 @@ pub async fn run(
             stdout,
             stderr,
             duration,
-            peak_memory_kb: None,
+            peak_memory_kb: match peak.load(Ordering::Relaxed) {
+                0 => None,
+                kb => Some(kb),
+            },
         });
     }
 
@@ -292,6 +328,55 @@ pub async fn run(
 /// limit; a `SIGKILL` after an allocation failure, or a non-zero exit with an
 /// allocation message, means the address-space limit. Distinguishing these
 /// matters because they are separate metrics and point at different fixes.
+/// How often to read the kernel's high-water mark while a process runs.
+///
+/// `VmHWM` is monotonic, so a coarser interval cannot overstate the peak — it
+/// can only miss a spike that both begins and ends inside one gap. 25 ms is
+/// cheap against proofs measured in seconds.
+const RSS_SAMPLE_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Track the peak resident set size of `pid` until the task is cancelled.
+///
+/// Read failures are ignored rather than reported: the expected one is the
+/// process exiting, at which point `/proc/<pid>` disappears and there is
+/// nothing left to measure.
+async fn sample_peak_rss(pid: u32, peak: Arc<AtomicU64>) {
+    let path = format!("/proc/{pid}/status");
+
+    loop {
+        if let Ok(status) = tokio::fs::read_to_string(&path).await
+            && let Some(kb) = parse_vm_hwm(&status)
+        {
+            peak.fetch_max(kb, Ordering::Relaxed);
+        }
+        tokio::time::sleep(RSS_SAMPLE_INTERVAL).await;
+    }
+}
+
+/// Extract `VmHWM` — peak resident set size, in kilobytes — from the contents
+/// of `/proc/<pid>/status`.
+///
+/// Returns `None` on any shape other than the expected one. This parses a
+/// kernel interface on a best-effort basis; a metric that fails to parse should
+/// go missing, not take down the job it was measuring.
+fn parse_vm_hwm(status: &str) -> Option<u64> {
+    let line = status
+        .lines()
+        .find(|line| line.starts_with("VmHWM:"))?
+        .strip_prefix("VmHWM:")?;
+
+    let mut fields = line.split_whitespace();
+    let value = fields.next()?.parse().ok()?;
+
+    // The kernel writes "kB" and has done for its whole history, but a silent
+    // unit change would be reported as a wildly wrong number rather than as an
+    // absent one, so it is checked rather than assumed.
+    match fields.next() {
+        Some("kB") | None => Some(value),
+        Some(_) => None,
+    }
+}
+
 fn classify_exit(code: Option<i32>, stderr: &str, bounds: Bounds) -> BoundedError {
     let looks_like_oom = mentions_allocation_failure(stderr);
 
@@ -453,6 +538,74 @@ mod tests {
         );
         assert!(err.is_transient());
         assert_eq!(err.metric_label(), "timeout");
+    }
+
+    // ---- peak memory ------------------------------------------------------
+
+    #[test]
+    fn vm_hwm_is_read_from_a_status_file() {
+        let status = "Name:\tbb\nVmPeak:\t 4194304 kB\nVmHWM:\t   43008 kB\nVmRSS:\t   41000 kB\n";
+        assert_eq!(parse_vm_hwm(status), Some(43_008));
+    }
+
+    /// A kernel interface that changed shape should make the metric go missing,
+    /// not report a wildly wrong number or panic the job it was measuring.
+    #[test]
+    fn an_unexpected_status_shape_yields_no_measurement() {
+        assert_eq!(parse_vm_hwm(""), None, "empty");
+        assert_eq!(parse_vm_hwm("VmRSS:\t 100 kB\n"), None, "no VmHWM line");
+        assert_eq!(parse_vm_hwm("VmHWM:\n"), None, "no value");
+        assert_eq!(parse_vm_hwm("VmHWM:\t lots kB\n"), None, "not a number");
+        assert_eq!(
+            parse_vm_hwm("VmHWM:\t 43008 MB\n"),
+            None,
+            "a unit change must not be read as kilobytes"
+        );
+    }
+
+    /// The measurement has to track what the process actually did, or the
+    /// address-space ceiling stays a guess that nobody can tell is wrong until
+    /// it starts failing healthy jobs.
+    #[tokio::test]
+    async fn peak_memory_reflects_what_the_process_allocated() {
+        let hungry = run(
+            "/usr/bin/python3",
+            &[
+                "-c".into(),
+                // Real bytes, not a lazily-zeroed mapping, held long enough
+                // to be sampled at least once.
+                "b = b'x' * (220 * 1024 * 1024)\nimport time; time.sleep(0.4)\nlen(b)".into(),
+            ],
+            &scratch_root(),
+            generous(),
+        )
+        .await
+        .expect("the allocation is well inside the bound");
+
+        let peak = hungry
+            .peak_memory_kb
+            .expect("a process that ran for 400ms should have been sampled");
+
+        assert!(
+            peak > 150_000,
+            "peak of {peak} kB does not reflect a 220 MB allocation"
+        );
+
+        let frugal = run(
+            "/usr/bin/python3",
+            &["-c".into(), "import time; time.sleep(0.4)".into()],
+            &scratch_root(),
+            generous(),
+        )
+        .await
+        .expect("should run");
+
+        let small = frugal.peak_memory_kb.expect("should have been sampled");
+        assert!(
+            small < peak / 2,
+            "an idle interpreter ({small} kB) should be well below the hungry \
+             one ({peak} kB), or the sampler is not measuring this process"
+        );
     }
 
     /// Exceeding a bound must not take the worker down with it.

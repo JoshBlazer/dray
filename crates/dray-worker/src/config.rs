@@ -28,6 +28,8 @@ pub struct Config {
     pub circuits: Vec<String>,
     pub worker: WorkerConfig,
     pub bounds: Bounds,
+    /// Where to serve `/metrics`.
+    pub metrics_bind: String,
     pub log_level: String,
     pub log_json: bool,
 }
@@ -159,6 +161,8 @@ impl Config {
             )?,
             worker,
             bounds,
+            metrics_bind: read("DRAY_WORKER_METRICS_BIND")
+                .unwrap_or_else(|| "0.0.0.0:9090".to_owned()),
             log_level: read("DRAY_LOG_LEVEL").unwrap_or_else(|| "info".to_owned()),
             log_json: read("DRAY_LOG_JSON")
                 .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),

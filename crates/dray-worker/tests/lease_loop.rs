@@ -772,3 +772,141 @@ async fn a_hundred_jobs_survive_workers_being_killed_throughout() {
     );
     eprintln!("{retried} of {LOAD} jobs needed more than one attempt");
 }
+
+// ---------------------------------------------------------------------------
+// Metrics
+//
+// Instruments that are never asserted against are decoration: they compile,
+// they render, and they can quietly count the wrong thing for months. These
+// drive real work through a real worker and check the numbers that come out.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_successful_job_is_counted_with_its_cost() {
+    let fixture = Fixture::build("metrics_ok").await;
+    let id = fixture.enqueue_on("range_proof", range_inputs(1), 3).await;
+
+    let (handle, signal) = shutdown();
+    let worker = fixture.worker("metrics-worker");
+    let metrics = worker.metrics();
+
+    let watcher = watch_until_settled(
+        fixture.store.clone(),
+        vec![id],
+        handle,
+        Duration::from_secs(120),
+    );
+    worker.run(signal).await;
+    watcher.await.expect("watcher");
+
+    let rendered = metrics.render();
+
+    assert!(
+        rendered.contains("outcome=\"proved\"} 1"),
+        "the proof was not counted: {rendered}"
+    );
+    assert_eq!(
+        metrics.proving_duration.count(),
+        1,
+        "proving duration was not observed"
+    );
+    assert_eq!(
+        metrics.attempts.count(),
+        1,
+        "the attempt count was not observed"
+    );
+
+    // Peak memory comes from the subprocess and is optional, but on this
+    // platform it should have been measured — a silently absent measurement
+    // would leave the memory ceiling unmonitored.
+    assert_eq!(
+        metrics.peak_memory_kb.count(),
+        1,
+        "peak memory was not measured, so the address-space ceiling is unmonitored"
+    );
+
+    assert!(
+        rendered.contains("dray_worker_failures_total"),
+        "failure counters should be present at zero: {rendered}"
+    );
+}
+
+/// A timeout and an out-of-memory kill must land in different counters. Their
+/// remedies are opposites, so an operator reading one aggregate number would be
+/// misled half the time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_timeout_is_counted_as_a_timeout_and_not_as_something_else() {
+    let mut fixture = Fixture::build("metrics_timeout").await;
+    fixture.prover.bounds.wall_clock = Duration::from_millis(50);
+
+    let id = fixture.enqueue_on("range_proof", range_inputs(2), 1).await;
+
+    let (handle, signal) = shutdown();
+    let worker = fixture.worker("metrics-worker");
+    let metrics = worker.metrics();
+
+    let watcher = watch_until_settled(
+        fixture.store.clone(),
+        vec![id],
+        handle,
+        Duration::from_secs(120),
+    );
+    worker.run(signal).await;
+    watcher.await.expect("watcher");
+
+    let rendered = metrics.render();
+
+    assert!(
+        rendered.contains("reason=\"timeout\"} 1"),
+        "the timeout was not counted as one: {rendered}"
+    );
+    assert!(
+        rendered.contains("reason=\"oom\"} 0"),
+        "a timeout was miscounted as an out-of-memory kill: {rendered}"
+    );
+    assert!(rendered.contains("outcome=\"failed\"} 1"), "{rendered}");
+    assert_eq!(
+        metrics.proving_duration.count(),
+        0,
+        "a failed attempt must not be recorded as proving time, or the \
+         distribution would be dominated by work that never produced a proof"
+    );
+}
+
+/// Queue depth and lease age are properties of the queue, so they are sampled
+/// rather than counted. A sampler that never ran would leave both at zero,
+/// which reads identically to a healthy idle system.
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_depth_is_sampled_from_the_store() {
+    let fixture = Fixture::build("metrics_gauges").await;
+
+    for n in 0..5 {
+        fixture
+            .enqueue_on("range_proof", range_inputs(100 + n), 3)
+            .await;
+    }
+
+    let mut config = WorkerConfig::new("gauge-worker");
+    config.lease_ttl = Duration::from_secs(60);
+    config.poll_interval = Duration::from_millis(50);
+    config.sample_interval = Duration::from_millis(100);
+    config.reap_interval = Duration::from_secs(60);
+
+    let worker = Worker::new(fixture.store.clone(), config, fixture.prover.clone());
+    let metrics = worker.metrics();
+
+    let (handle, signal) = shutdown();
+    let stopper = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        handle.trigger();
+    });
+
+    worker.run(signal).await;
+    stopper.await.expect("stopper");
+
+    assert!(
+        metrics.queue_depth.get() > 0,
+        "queue depth was never sampled: an unsampled gauge reads exactly like \
+         an empty queue"
+    );
+}

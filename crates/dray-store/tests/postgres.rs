@@ -1311,3 +1311,48 @@ async fn reaping_returns_a_job_with_attempts_left_to_the_queue() {
         "the log should say the lease expired, not invent a decision: {history:?}"
     );
 }
+
+/// Lease age is what separates "busy" from "wedged": under both, the queue
+/// depth is flat and nothing moves. It has to come from the database clock,
+/// because a worker with a skewed clock would otherwise report a nonsense age
+/// for a job it is holding perfectly well.
+#[tokio::test]
+async fn lease_age_reports_the_longest_held_lease() {
+    let store = isolated_store("lease_age").await;
+    seed_jobs(&store, 2).await;
+
+    assert_eq!(
+        store.oldest_lease_age().await.unwrap(),
+        None,
+        "nothing leased should report no age at all, not an age of zero"
+    );
+
+    store
+        .lease_next("worker-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    store
+        .lease_next("worker-2", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let age = store
+        .oldest_lease_age()
+        .await
+        .unwrap()
+        .expect("two jobs are leased");
+
+    assert!(
+        age >= Duration::from_secs(1),
+        "should report the *oldest* lease, not the newest: got {age:?}"
+    );
+    assert!(
+        age < Duration::from_secs(30),
+        "an implausible age suggests the wrong clock: {age:?}"
+    );
+}

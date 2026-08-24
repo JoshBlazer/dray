@@ -6,8 +6,11 @@
 
 use std::process::ExitCode;
 
+use std::sync::Arc;
+
 use dray_worker::{
     config::Config,
+    metrics::Metrics,
     prover::{self, ProverConfig},
     worker::{ShutdownHandle, Worker, shutdown},
 };
@@ -68,8 +71,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let signals = tokio::spawn(await_signals(handle));
 
     let worker = Worker::new(store, config.worker.clone(), prover_config);
+
+    // Serving metrics from the worker process rather than a sidecar keeps the
+    // numbers and the thing they describe in the same lifetime: if the worker
+    // is gone, the scrape fails, which is itself the signal.
+    let metrics = tokio::spawn(serve_metrics(config.metrics_bind.clone(), worker.metrics()));
+
     let outcomes = worker.run(signal).await;
 
+    metrics.abort();
     signals.abort();
 
     tracing::info!(attempts = outcomes.len(), "stopped cleanly");
@@ -116,6 +126,44 @@ async fn await_signals(handle: ShutdownHandle) {
     }
 
     handle.trigger();
+}
+
+/// Serve `GET /metrics` for Prometheus to scrape.
+///
+/// A failure to bind is logged and tolerated rather than fatal. Losing
+/// observability is bad; refusing to prove anything because a metrics port was
+/// already taken would be worse.
+async fn serve_metrics(bind: String, metrics: Arc<Metrics>) {
+    use axum::{Router, extract::State, routing::get};
+
+    let app = Router::new()
+        .route(
+            "/metrics",
+            get(|State(metrics): State<Arc<Metrics>>| async move {
+                (
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "text/plain; version=0.0.4; charset=utf-8",
+                    )],
+                    metrics.render(),
+                )
+            }),
+        )
+        .route("/healthz", get(|| async { "ok" }))
+        .with_state(metrics);
+
+    let listener = match tokio::net::TcpListener::bind(&bind).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            tracing::error!(bind = %bind, error = %err, "could not serve metrics");
+            return;
+        }
+    };
+
+    tracing::info!(bind = %bind, "serving metrics");
+    if let Err(err) = axum::serve(listener, app).await {
+        tracing::error!(error = %err, "the metrics server stopped");
+    }
 }
 
 fn init_tracing(config: &Config) {

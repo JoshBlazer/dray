@@ -841,6 +841,31 @@ impl Store {
         .await
     }
 
+    /// How long the longest-held lease has been held, in seconds.
+    ///
+    /// Returns `None` when nothing is leased. Feeds the lease-age metric, which
+    /// is how a worker stuck holding a job becomes visible: queue depth alone
+    /// cannot distinguish "busy" from "wedged", because in both cases nothing
+    /// is moving.
+    ///
+    /// Measured against the database clock, so a worker with a skewed clock
+    /// cannot report a negative or absurd age.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures.
+    pub async fn oldest_lease_age(&self) -> Result<Option<std::time::Duration>, StoreError> {
+        let row = sqlx::query(
+            "SELECT extract(epoch FROM now() - min(updated_at))::double precision AS age
+             FROM jobs WHERE state IN ('leased', 'proving')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let age: Option<f64> = row.try_get("age")?;
+        Ok(age.map(|seconds| std::time::Duration::from_secs_f64(seconds.max(0.0))))
+    }
+
     /// How many jobs are waiting to be leased. Feeds backpressure and the
     /// queue-depth metric.
     ///

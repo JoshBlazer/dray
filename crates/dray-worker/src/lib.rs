@@ -19,7 +19,9 @@
 pub mod backoff;
 pub mod bounded;
 pub mod config;
+pub mod metrics;
 pub mod prover;
+mod task;
 pub mod worker;
 
 /// Component name used in logs and metrics.

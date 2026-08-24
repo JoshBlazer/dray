@@ -39,7 +39,7 @@
 //! module is owned by one, so cancelling a worker cancels everything it
 //! started.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use dray_store::{Job, Store};
 use tokio::sync::watch;
@@ -47,31 +47,10 @@ use uuid::Uuid;
 
 use crate::{
     backoff::Backoff,
+    metrics::Metrics,
     prover::{self, ProveError, Proven, ProverConfig},
+    task::TaskGuard,
 };
-
-/// A spawned task that is aborted when the guard is dropped.
-///
-/// See the module documentation: a detached heartbeat outliving its attempt
-/// silently loses jobs, so nothing here is allowed to detach.
-#[derive(Debug)]
-struct TaskGuard<T>(tokio::task::JoinHandle<T>);
-
-impl<T: Send + 'static> TaskGuard<T> {
-    fn spawn(future: impl std::future::Future<Output = T> + Send + 'static) -> Self {
-        Self(tokio::spawn(future))
-    }
-
-    fn handle(&mut self) -> &mut tokio::task::JoinHandle<T> {
-        &mut self.0
-    }
-}
-
-impl<T> Drop for TaskGuard<T> {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
 
 /// How a single attempt ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +72,17 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    /// The label this outcome is counted under in metrics.
+    #[must_use]
+    pub fn metric_label(&self) -> &'static str {
+        match self {
+            Outcome::Proved(_) => "proved",
+            Outcome::Failed { .. } => "failed",
+            Outcome::LeaseLost(_) => "lease_lost",
+            Outcome::Abandoned(_) => "abandoned",
+        }
+    }
+
     #[must_use]
     pub fn job_id(&self) -> Uuid {
         match self {
@@ -119,6 +109,8 @@ pub struct WorkerConfig {
     pub shutdown_grace: Duration,
     /// How often to return expired leases to the queue.
     pub reap_interval: Duration,
+    /// How often to refresh the queue-depth and lease-age gauges.
+    pub sample_interval: Duration,
     pub backoff: Backoff,
 }
 
@@ -140,6 +132,7 @@ impl WorkerConfig {
             poll_interval: Duration::from_millis(500),
             shutdown_grace: Duration::from_secs(30),
             reap_interval: Duration::from_secs(30),
+            sample_interval: Duration::from_secs(15),
             backoff: Backoff::default(),
         }
     }
@@ -151,16 +144,25 @@ pub struct Worker {
     store: Store,
     config: WorkerConfig,
     prover: ProverConfig,
+    metrics: Arc<Metrics>,
 }
 
 impl Worker {
     #[must_use]
     pub fn new(store: Store, config: WorkerConfig, prover: ProverConfig) -> Self {
+        let metrics = Arc::new(Metrics::new(config.worker_id.clone()));
         Self {
             store,
             config,
             prover,
+            metrics,
         }
+    }
+
+    /// Share this worker's metrics, so the process can expose them for scraping.
+    #[must_use]
+    pub fn metrics(&self) -> Arc<Metrics> {
+        Arc::clone(&self.metrics)
     }
 
     #[must_use]
@@ -186,6 +188,17 @@ impl Worker {
             self.store.clone(),
             self.config.worker_id.clone(),
             self.config.reap_interval,
+            Arc::clone(&self.metrics),
+        ));
+
+        // Queue depth and lease age describe the queue, not this worker, so
+        // they have to be sampled rather than counted. Lease age is what
+        // separates "busy" from "wedged": under both, nothing moves and the
+        // depth stays flat.
+        let _sampler = TaskGuard::spawn(sample_loop(
+            self.store.clone(),
+            self.config.sample_interval,
+            Arc::clone(&self.metrics),
         ));
 
         loop {
@@ -203,6 +216,7 @@ impl Worker {
                 Ok(Some(job)) => {
                     let id = job.id;
                     let outcome = self.attempt(job, &mut shutdown).await;
+                    self.metrics.record_outcome(outcome.metric_label());
                     tracing::info!(job = %id, outcome = ?outcome, "attempt finished");
                     outcomes.push(outcome);
                 }
@@ -315,7 +329,14 @@ impl Worker {
                     )
                     .await
                 {
-                    Ok(_) => Outcome::Proved(id),
+                    Ok(_) => {
+                        self.metrics.record_proof(
+                            proven.duration,
+                            proven.peak_memory_kb,
+                            job.attempts,
+                        );
+                        Outcome::Proved(id)
+                    }
                     Err(err) => {
                         // The proof exists but could not be stored. The lease
                         // will expire and another worker will redo the work —
@@ -336,6 +357,8 @@ impl Worker {
                         Some(self.config.backoff.delay_random(attempt))
                     }
                 };
+
+                self.metrics.record_failure(failure.metric_label());
 
                 tracing::warn!(
                     job = %id,
@@ -395,17 +418,42 @@ async fn heartbeat(store: Store, id: Uuid, worker_id: String, ttl: Duration, int
 /// Errors are logged and the loop continues. The reaper is a recovery
 /// mechanism; a reaper that gave up on the first database error would be
 /// missing during exactly the incident it exists for.
-async fn reap_loop(store: Store, worker_id: String, interval: Duration) {
+async fn reap_loop(store: Store, worker_id: String, interval: Duration, metrics: Arc<Metrics>) {
     let mut ticker = tokio::time::interval(interval);
 
     loop {
         ticker.tick().await;
         match store.reap_expired_leases(&worker_id).await {
             Ok(reaped) if !reaped.is_empty() => {
+                metrics.leases_reaped.add(reaped.len() as u64);
                 tracing::info!(count = reaped.len(), "returned expired leases to the queue");
             }
             Ok(_) => {}
             Err(err) => tracing::warn!(error = %err, "reaping failed; will retry"),
+        }
+    }
+}
+
+/// Refresh the gauges that describe the queue rather than this worker.
+async fn sample_loop(store: Store, interval: Duration, metrics: Arc<Metrics>) {
+    let mut ticker = tokio::time::interval(interval);
+
+    loop {
+        ticker.tick().await;
+
+        match store.queue_depth().await {
+            Ok(depth) => metrics.queue_depth.set(depth),
+            Err(err) => tracing::warn!(error = %err, "could not sample queue depth"),
+        }
+
+        match store.oldest_lease_age().await {
+            // Nothing leased reports zero rather than leaving the last value
+            // stale, or a drained queue would go on showing the age it saw
+            // just before it drained.
+            Ok(age) => metrics
+                .oldest_lease_age
+                .set(age.map_or(0, |age| i64::try_from(age.as_secs()).unwrap_or(i64::MAX))),
+            Err(err) => tracing::warn!(error = %err, "could not sample lease age"),
         }
     }
 }
@@ -534,42 +582,6 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), signal.requested())
             .await
             .expect("a dropped handle should release waiters");
-    }
-
-    /// The bug the chaos test found: a detached heartbeat outlived the worker
-    /// that started it and went on renewing the lease for work that had
-    /// stopped, so the job was never reaped and never came back.
-    #[tokio::test]
-    async fn a_guarded_task_stops_when_its_guard_is_dropped() {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        };
-
-        let ticks = Arc::new(AtomicUsize::new(0));
-
-        let guard = {
-            let ticks = Arc::clone(&ticks);
-            TaskGuard::spawn(async move {
-                loop {
-                    ticks.fetch_add(1, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-        };
-
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        let while_alive = ticks.load(Ordering::SeqCst);
-        assert!(while_alive > 0, "the task should have run at all");
-
-        drop(guard);
-
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        let after_drop = ticks.load(Ordering::SeqCst);
-        assert!(
-            after_drop <= while_alive + 1,
-            "the task kept running after its guard was dropped: {while_alive} -> {after_drop}"
-        );
     }
 
     #[test]
