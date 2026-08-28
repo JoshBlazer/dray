@@ -1,7 +1,7 @@
 # Dray — Progress
 
-**Current phase:** 3 — Proof worker pool (complete) → 4 — Relayer and settlement
-**Last updated:** 2026-08-24
+**Current phase:** 4 — Relayer and on-chain settlement (in progress)
+**Last updated:** 2026-08-28
 **Build status:** green — `make build`, `make test`, and `make lint` pass
 locally, and CI is green on a fresh clone across all five jobs.
 Repository: <https://github.com/JoshBlazer/dray>
@@ -14,7 +14,7 @@ Repository: <https://github.com/JoshBlazer/dray>
 | 1 | Circuits and on-chain verification | done | yes | `make e2e-circuits` proves both circuits and settles them on Anvil |
 | 2 | Ingest API and durable job store | done | yes | Verified in CI against real Postgres; not yet locally (no Docker) |
 | 3 | Proof worker pool | done | yes | 100 jobs across 4 workers proved exactly once; the same run with workers killed throughout loses nothing |
-| 4 | Relayer and on-chain settlement | not started | no | |
+| 4 | Relayer and on-chain settlement | in progress | no | Settles on a local chain, survives reorgs and nonce gaps. The exit criterion needs a funded Base Sepolia account |
 | 5 | Observability, operations, hardening | not started | no | |
 | 6 | Documentation, demo, release | not started | no | |
 
@@ -209,6 +209,11 @@ gcc 15.2.0, libc6-dev, and GNU Make 4.4.1. `make build`, `make test`, and
 | 2026-08-12 | `wouldSettle` catches verifier reverts and returns false | Found by a fuzz test: the generated verifier reverts rather than returning false, which made pre-flight useless for its one job | Letting the revert propagate, which would give the relayer an exception instead of an answer |
 | 2026-08-17 | ADR-008: circuits *return* the nullifier, so it is the last public input | Found while wiring the worker: a supplied nullifier is a Pedersen hash of private data, so requiring one means the client must run a proving stack to place an order. Also exposed that `membership`'s registered schema was missing `root`, making every submittable job unsolvable | Pedersen in Rust in the worker (two implementations to keep in exact agreement, diverging only after a proof has been paid for), or client-computed nullifiers (defeats the product) |
 | 2026-08-24 | ADR-009: Redis mirrors leases, and `Liveness::Unknown` is distinct from `Free` | Collapsing them would make a Redis outage look like every lease expiring at once, handing every in-flight job to a second worker — a cache outage becoming a fleet-wide stampede of duplicated proving | A two-valued liveness check (fails exactly when it is most needed), or making Redis authoritative for leases (contradicts the spec's recoverability invariant) |
+| 2026-08-24 | ADR-010: Base Sepolia as the target testnet | Decided by the human. ~2s blocks make a confirmation depth of N a short enough wait to test against the real chain, not only against Anvil | Ethereum Sepolia, where 12s blocks make confirmation tests slow enough that they stop being run |
+| 2026-08-24 | ADR-011: a small permissioned set of relayers | Decided by the human. One relayer can be lost without settlement stopping, which a single operator cannot offer | A single trusted operator (simpler and honest, but no redundancy), or one shared key across processes (needs distributed nonce allocation, which is the genuinely hard version and buys nothing here) |
+| 2026-08-28 | `proved` jobs are leased, like `queued` ones | With a set of relayers, two would otherwise submit the same proof: the first settles, the second reverts on a consumed nullifier. Correct, but it burns real gas to learn what the database already knew | Relying on the nullifier set alone, which makes the on-chain backstop the primary mechanism and pays for it every time |
+| 2026-08-28 | Submission attempts are counted separately from proving attempts | A job that needed two tries to prove would otherwise arrive at the relayer with its budget two-thirds spent, and could exhaust itself on one RPC blip — discarding a valid proof | One shared counter, which conflates work that costs seconds of CPU with work that costs a nonce and real gas |
+| 2026-08-28 | Reorgs are detected by asking whether the nullifier is still consumed | That is what a settlement *is* to this system. It stays correct when a transaction is re-mined into a different block, which needs no action | Tracking block hashes, which reports a "reorg" for a harmless re-mine and needs a schema column to store |
 
 ## Open questions (for the human)
 
@@ -227,35 +232,82 @@ gcc 15.2.0, libc6-dev, and GNU Make 4.4.1. `make build`, `make test`, and
 
 ## Next actions
 
-Phase 3 is closed. Every task and both exit criteria are met, verified by
-execution rather than by inspection:
+Phase 4 — the relayer and on-chain settlement — is under way. Every task is
+built and tested against a real chain; what remains is the exit criterion,
+which needs something only the human can supply.
 
-1. **Lease acquisition** with `SELECT ... FOR UPDATE SKIP LOCKED`, mirrored into
-   Redis. The attempt counter increments *at lease time*, because a worker
-   killed mid-proof never reports anything and a counter advanced only on
-   completion would let a poison job retry for ever.
-2. **Lease renewal** during long proofs, and a reaper in every worker. A killed
-   worker cannot return its own leases — that is what a lease is for — so
-   recovery has to come from whoever is still alive.
-3. **Resource-bounded subprocesses**: wall clock, `RLIMIT_AS`, `RLIMIT_CPU`,
-   applied through `sh`'s `ulimit` before `exec` so `unsafe_code = "forbid"`
-   survives. Scratch cleanup lives in `Drop`, so it runs on panic too.
-4. **Attempt accounting** with exponential backoff and jitter, held in Postgres
-   rather than in the worker that failed.
-5. **Graceful shutdown** on SIGTERM: stop leasing, finish within the grace
-   period or hand the job straight back.
-6. **Prometheus metrics** on `/metrics`, including peak memory measured from
-   `VmHWM` rather than guessed.
+Done:
 
-**Exit criteria, both green in CI:**
+1. **Single-writer nonce management.** Each relayer holds its own key, so each
+   owns one nonce sequence (ADR-011). The lock is held across the whole
+   submission rather than just the allocation — otherwise two transactions can
+   be broadcast out of order, and a permanent failure on the earlier one
+   strands the later one for ever.
+2. **Gas policy.** Estimate, cap, and bump-and-replace. Both EIP-1559 fees rise
+   together, because nodes check both against their 10% replacement rule and a
+   bump that raises only `maxFeePerGas` is refused while looking like it
+   worked. A bump the ceiling would clamp below that threshold reports the
+   ceiling instead of buying a round trip to be told "underpriced".
+3. **Confirmation tracking and reorg handling.** Confirmed to N blocks, then
+   *watched*, because a depth that makes a reorg unlikely does not make it
+   impossible. A settlement that disappears returns the job to `proved` and is
+   submitted again, keeping the proof.
+4. **Batching** — deferred to v1.1 by ADR-004. Not built.
+5. **Relayer authentication on chain.** `setRelayer` was already there; the
+   deploy script now authorises a set of them from `DRAY_RELAYERS`, and a
+   relayer that is not authorised refuses to start rather than producing a
+   stream of identical reverts.
+6. **Failure taxonomy.** Three outcomes, not two — the third being "already
+   settled", which arrives disguised as a revert and would otherwise mark a
+   settled job failed.
 
-- 100 jobs across 4 workers, every one proved exactly once — no loss, no
-  duplication, asserted against the transition log rather than against what the
-  workers reported.
-- The same 100-job run with workers killed mid-proof throughout. Every job still
-  proves exactly once.
+Remaining:
 
-### What Phase 3 found
+7. **Deploy to Base Sepolia and settle one job through the whole system.** The
+   exit criterion. Needs a funded account on Base Sepolia, which is the one
+   thing that cannot be produced from this side. See below.
+
+**Exit criterion:** a job submitted at the API arrives as a verified on-chain
+settlement on a public testnet, with the transaction hash recorded here.
+
+### What is needed to close Phase 4
+
+Two things from the human:
+
+- **A funded Base Sepolia account** for the relayer. Base Sepolia ETH comes
+  from a faucet; a settlement costs roughly 3.8M gas, so a small balance covers
+  many runs.
+- **An RPC endpoint.** `https://sepolia.base.org` is public and works; a keyed
+  provider is steadier under load.
+
+Then `make deploy` with `DRAY_RPC_URL` and `PRIVATE_KEY` set puts the stack on
+chain, and the same three services that `make e2e` runs locally settle a real
+job. The transaction hash lands in this file.
+
+### What Phase 4 found
+
+Four bugs, all surfaced by the Anvil suite rather than by review — three of
+them mine, and each one silent in a different way:
+
+- **`renew_lease` never covered `submitting`.** Every relayer heartbeat
+  returned false, so a relayer abandoned its own work the moment a settlement
+  took longer than one heartbeat interval. The fast tests passed because they
+  finish before the first tick.
+- **A replacement transaction was recorded as a second settlement**, which the
+  schema's one-live-settlement-per-nullifier index correctly refused. A bumped
+  or re-nonced transaction is the same settlement carried by a different hash.
+- **The bump path never recorded its new hash at all.** Confirmation matches on
+  `tx_hash`, so a bumped transaction would have confirmed nothing while the row
+  went on naming a transaction that no longer existed.
+- **`confirm_settlement` cleared `reorged_at`.** After a reorg the relayer
+  rebuilds an identical transaction with an identical hash, so matching on hash
+  alone resurrected the historical row.
+
+Plus one from the ecosystem: alloy's `providers` feature builds a provider with
+no transport, which fails at *runtime* with "no transports enabled" rather than
+at compile time. That would have been a start-up failure in production.
+
+### What Phase 3 found### What Phase 3 found
 
 Three real defects, all caught by tests that drove real failures rather than
 mocks:
