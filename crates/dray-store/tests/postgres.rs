@@ -1726,3 +1726,279 @@ async fn a_job_that_kills_every_relayer_eventually_fails() {
         "a proof nobody can submit must stop being handed out"
     );
 }
+
+/// A replacement transaction is the *same* settlement carried by a different
+/// hash. Recording it as a second one violates the one-live-settlement-per-
+/// nullifier index — which exists precisely because that is what a double
+/// submission looks like.
+#[tokio::test]
+async fn a_replacement_transaction_updates_the_settlement_rather_than_adding_one() {
+    let store = isolated_store("replace_tx").await;
+    let id = proved_job(&store).await;
+    store
+        .lease_next_proved("relayer-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let original = [0xA1_u8; 32];
+    let nullifier = [0xC0_u8; 32];
+    store
+        .record_submission(id, &original, &nullifier)
+        .await
+        .unwrap();
+
+    let bumped = [0xB2_u8; 32];
+    store
+        .replace_submission_tx(id, &original, &bumped)
+        .await
+        .unwrap();
+
+    let settlement = store.latest_settlement(id).await.unwrap().unwrap();
+    assert_eq!(
+        settlement.tx_hash, bumped,
+        "the row should name the transaction that is actually in flight"
+    );
+    assert_eq!(
+        settlement.nullifier, nullifier,
+        "the nullifier is unchanged; only the carrier moved"
+    );
+
+    // Exactly one settlement, not two.
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM settlements WHERE job_id = $1")
+        .bind(id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "a replacement must not create a second settlement"
+    );
+}
+
+/// The confirmation path matches on `tx_hash`. If a replacement did not update
+/// the row, confirming would update nothing and the job would settle against a
+/// transaction that no longer exists.
+#[tokio::test]
+async fn a_replaced_transaction_can_still_be_confirmed() {
+    let store = isolated_store("replace_confirm").await;
+    let id = proved_job(&store).await;
+    store
+        .lease_next_proved("relayer-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let original = [0x01_u8; 32];
+    let bumped = [0x02_u8; 32];
+    store
+        .record_submission(id, &original, &[0x03_u8; 32])
+        .await
+        .unwrap();
+    store
+        .replace_submission_tx(id, &original, &bumped)
+        .await
+        .unwrap();
+
+    let job = store
+        .confirm_settlement(
+            id,
+            "relayer-1",
+            &bumped,
+            &dray_store::Receipt {
+                block_number: 42,
+                confirmations: 3,
+                gas_used: Some(3_760_024),
+                effective_gas_price: Some("1000000000".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(job.state, JobState::Settled);
+    let settlement = store.latest_settlement(id).await.unwrap().unwrap();
+    assert_eq!(settlement.block_number, Some(42));
+    assert_eq!(settlement.gas_used, Some(3_760_024));
+}
+
+/// A resubmission after a reorg rebuilds the same call at the same nonce and
+/// price, so it has the *same* transaction hash as the settlement that was
+/// unwound. Confirming must touch only the live row — reviving the reorged one
+/// would leave two live settlements for one nullifier.
+#[tokio::test]
+async fn confirming_does_not_revive_a_reorged_settlement_with_the_same_hash() {
+    let store = isolated_store("reorg_same_hash").await;
+    let id = proved_job(&store).await;
+
+    let tx_hash = [0x77_u8; 32];
+    let nullifier = [0x88_u8; 32];
+
+    // Settle, then reorg it away.
+    store
+        .lease_next_proved("relayer-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .record_submission(id, &tx_hash, &nullifier)
+        .await
+        .unwrap();
+    store
+        .confirm_settlement(
+            id,
+            "relayer-1",
+            &tx_hash,
+            &dray_store::Receipt {
+                block_number: 10,
+                confirmations: 5,
+                gas_used: Some(1),
+                effective_gas_price: None,
+            },
+        )
+        .await
+        .unwrap();
+    store.record_reorg(id, "relayer-1", &tx_hash).await.unwrap();
+
+    // Resubmit and confirm the *identical* transaction hash.
+    store
+        .lease_next_proved("relayer-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .record_submission(id, &tx_hash, &nullifier)
+        .await
+        .expect("a second live settlement is allowed once the first is reorged");
+    store
+        .confirm_settlement(
+            id,
+            "relayer-1",
+            &tx_hash,
+            &dray_store::Receipt {
+                block_number: 20,
+                confirmations: 5,
+                gas_used: Some(2),
+                effective_gas_price: None,
+            },
+        )
+        .await
+        .expect("confirming must not resurrect the reorged row");
+
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM settlements WHERE job_id = $1 AND reorged_at IS NULL",
+    )
+    .bind(id)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(live, 1, "exactly one settlement should be live");
+
+    let historical: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM settlements WHERE job_id = $1 AND reorged_at IS NOT NULL",
+    )
+    .bind(id)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        historical, 1,
+        "the reorged settlement should stay stamped — that is the history"
+    );
+}
+
+/// The reorg watcher only looks at jobs that are currently settled.
+#[tokio::test]
+async fn only_settled_jobs_are_watched_for_reorgs() {
+    let store = isolated_store("watch").await;
+    let id = proved_job(&store).await;
+
+    store
+        .lease_next_proved("relayer-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    let tx_hash = [0x55_u8; 32];
+    store
+        .record_submission(id, &tx_hash, &[0x66_u8; 32])
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .settlements_to_watch(Duration::from_secs(600))
+            .await
+            .unwrap()
+            .is_empty(),
+        "a job still submitting is not settled, so there is nothing to unwind yet"
+    );
+
+    store
+        .confirm_settlement(
+            id,
+            "relayer-1",
+            &tx_hash,
+            &dray_store::Receipt {
+                block_number: 1,
+                confirmations: 1,
+                gas_used: None,
+                effective_gas_price: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let watching = store
+        .settlements_to_watch(Duration::from_secs(600))
+        .await
+        .unwrap();
+    assert_eq!(watching.len(), 1);
+    assert_eq!(watching[0].0, id);
+
+    // Once unwound, it is back on the submit queue and no longer watched.
+    store.record_reorg(id, "relayer-1", &tx_hash).await.unwrap();
+    assert!(
+        store
+            .settlements_to_watch(Duration::from_secs(600))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A settlement this relayer did not send has no transaction hash to record.
+/// Inventing one would put a lie in the audit trail; the job is still settled.
+#[tokio::test]
+async fn a_job_settled_elsewhere_is_recorded_without_a_fabricated_transaction() {
+    let store = isolated_store("elsewhere").await;
+    let id = proved_job(&store).await;
+    store
+        .lease_next_proved("relayer-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let job = store
+        .mark_settled_elsewhere(
+            id,
+            "relayer-1",
+            "the nullifier was already consumed on chain",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(job.state, JobState::Settled);
+    assert!(job.leased_by.is_none());
+    assert!(
+        store.latest_settlement(id).await.unwrap().is_none(),
+        "no transaction hash is known, so none should be recorded"
+    );
+
+    let history = store.transitions(id).await.unwrap();
+    assert!(
+        history
+            .iter()
+            .any(|(_, event, to)| *event == JobEvent::SettlementConfirmed
+                && *to == JobState::Settled),
+        "the transition should still be logged: {history:?}"
+    );
+}
