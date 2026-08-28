@@ -1641,8 +1641,13 @@ dependencies = [
 name = "dray-cli"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dray-core",
  "dray-store",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

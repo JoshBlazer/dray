@@ -236,7 +236,10 @@ pub async fn prove(
     // inputs fails permanently, so there is no reason to pay for setup first.
     let prover_toml = render_prover_toml(inputs)?;
 
-    let scratch = Scratch::new(&config.scratch_root, label)
+    // Absolute for the same reason as in `prepare`: the paths below are handed
+    // to subprocesses whose working directory is not this one.
+    let scratch_root = absolute(&config.scratch_root)?;
+    let scratch = Scratch::new(&scratch_root, label)
         .map_err(|e| ProveError::Scratch(format!("creating scratch for {label}: {e}")))?;
 
     let package = scratch.path().join("package");
@@ -321,6 +324,15 @@ pub async fn prepare(
     config: &ProverConfig,
 ) -> Result<Artifacts, ProveError> {
     let bounds = Bounds::for_preparation();
+
+    // Every path handed to a subprocess is made absolute first. These commands
+    // run with their working directory set elsewhere — `nargo` in the circuits
+    // workspace, `bb` in the artefact directory — so a relative path resolves
+    // against the wrong place and the tool reports a missing file. The tests
+    // canonicalise their fixtures and so never saw it; the binary's default of
+    // `circuits` is relative, and did.
+    let circuits_dir = &absolute(circuits_dir)?;
+    let into = &absolute(into)?;
 
     bounded::run(&config.nargo, &["compile".to_owned()], circuits_dir, bounds)
         .await
@@ -497,6 +509,21 @@ fn type_name(value: &serde_json::Value) -> &'static str {
 // ---------------------------------------------------------------------------
 // Filesystem helpers
 // ---------------------------------------------------------------------------
+
+/// Resolve a path to an absolute one, creating it if it does not yet exist.
+///
+/// `canonicalize` requires the path to exist, and an artefact directory
+/// legitimately may not on a first run — so it is created rather than treated
+/// as an error.
+fn absolute(path: &Path) -> Result<PathBuf, ProveError> {
+    if !path.exists() {
+        std::fs::create_dir_all(path)
+            .map_err(|e| ProveError::Scratch(format!("creating {}: {e}", path.display())))?;
+    }
+
+    path.canonicalize()
+        .map_err(|e| ProveError::Scratch(format!("resolving {}: {e}", path.display())))
+}
 
 /// Reject paths that are not valid UTF-8 rather than lossily converting them.
 ///

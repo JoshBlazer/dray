@@ -60,41 +60,30 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-for tool in nargo bb forge anvil cast cargo; do
+for tool in nargo bb forge anvil cast cargo curl; do
     command -v "$tool" >/dev/null || die "$tool not found. Run: make setup && make setup-zk"
 done
 
-# Postgres is reached through the container when psql is not installed locally,
-# so the quickstart needs only Docker and Rust as advertised. Same fallback as
-# `make seed`.
-COMPOSE="${COMPOSE:-docker compose}"
-if command -v psql >/dev/null 2>&1; then
-    psql_admin() { psql "$ADMIN_URL" -v ON_ERROR_STOP=1 "$@"; }
-    psql_db()    { psql "$DATABASE_URL" -v ON_ERROR_STOP=1 "$@"; }
-else
-    note "psql not found locally; using the postgres container"
-    psql_admin() { $COMPOSE exec -T postgres psql -U dray -d dray -v ON_ERROR_STOP=1 "$@"; }
-    psql_db()    { $COMPOSE exec -T postgres psql -U dray -d dray_e2e -v ON_ERROR_STOP=1 "$@"; }
-fi
+# Database work goes through the `dray` CLI rather than psql, so this needs only
+# Docker and Rust — which is what the README promises. Requiring a Postgres
+# client package would quietly make that untrue.
+DRAY="./target/debug/dray"
+
+# ---------------------------------------------------------------------------
+log "Building the services"
+# ---------------------------------------------------------------------------
+cargo build --quiet -p dray-api -p dray-worker -p dray-relayer -p dray-cli
+note "dray-api, dray-worker, dray-relayer, dray built"
 
 # ---------------------------------------------------------------------------
 log "Preparing a clean database"
 # ---------------------------------------------------------------------------
 # A dedicated database, so the run is reproducible and does not inherit
 # whatever a previous session left behind.
-psql_admin -c "DROP DATABASE IF EXISTS dray_e2e WITH (FORCE)" >/dev/null
-psql_admin -c "CREATE DATABASE dray_e2e" >/dev/null
-for f in migrations/*.sql; do
-    psql_db < "$f" >/dev/null
-done
-psql_db < scripts/seed-circuits.sql >/dev/null
+DATABASE_URL="$ADMIN_URL" "$DRAY" reset dray_e2e
+DATABASE_URL="$DATABASE_URL" "$DRAY" migrate
+DATABASE_URL="$DATABASE_URL" "$DRAY" exec scripts/seed-circuits.sql
 note "migrations applied and circuits registered"
-
-# ---------------------------------------------------------------------------
-log "Building the services"
-# ---------------------------------------------------------------------------
-cargo build --quiet -p dray-api -p dray-worker -p dray-relayer
-note "dray-api, dray-worker, dray-relayer built"
 
 # ---------------------------------------------------------------------------
 log "Starting Anvil on port $ANVIL_PORT"
@@ -193,25 +182,26 @@ log "Waiting for the proof to be generated and settled"
 # ---------------------------------------------------------------------------
 STATE=""
 for _ in $(seq 1 400); do
-    STATE="$(psql_db -tAc "SELECT state FROM jobs WHERE id = '$JOB_ID'" 2>/dev/null \
-        | tr -d '[:space:]')"
+    job_json="$(DATABASE_URL="$DATABASE_URL" "$DRAY" job "$JOB_ID" 2>/dev/null || true)"
+    STATE="$(python3 -c 'import json,sys
+raw = sys.stdin.read().strip()
+print(json.loads(raw)["state"] if raw else "")' <<<"$job_json")"
     case "$STATE" in
         settled) break ;;
-        failed|rejected) die "the job ended in state '$STATE': $(psql_db -tAc \
-            "SELECT last_error FROM jobs WHERE id = '$JOB_ID'")" ;;
+        failed|rejected)
+            die "the job ended in state '\''$STATE'\'': $job_json" ;;
     esac
     sleep 0.5
 done
 [[ "$STATE" == "settled" ]] || die "the job is still '$STATE' after 200 seconds"
 
-settlement_row="$(psql_db -tAc \
-    "SELECT '0x' || encode(tx_hash, 'hex') || ' ' || block_number || ' ' || gas_used
-     FROM settlements WHERE job_id = '$JOB_ID' AND reorged_at IS NULL")"
-read -r TX_HASH BLOCK GAS_USED <<<"$(tr -d '\r' <<<"$settlement_row")"
+settlement_json="$(DATABASE_URL="$DATABASE_URL" "$DRAY" settlement "$JOB_ID")" \
+    || die "no settlement was recorded for $JOB_ID"
 
-NULLIFIER="0x$(psql_db -tAc \
-    "SELECT encode(nullifier, 'hex') FROM settlements WHERE job_id = '$JOB_ID'" \
-    | tr -d '[:space:]')"
+read -r TX_HASH BLOCK GAS_USED NULLIFIER <<<"$(python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+print(s["tx_hash"], s["block_number"], s["gas_used"], s["nullifier"])' <<<"$settlement_json")"
 
 note "settled in block $BLOCK using $GAS_USED gas"
 note "transaction $TX_HASH"
@@ -220,9 +210,13 @@ note "nullifier   $NULLIFIER"
 # ---------------------------------------------------------------------------
 log "Confirming on chain, independently of Dray's own record"
 # ---------------------------------------------------------------------------
+# `cast` reports status as "true"/"false" on some versions and "1"/"0" on
+# others, so both spellings of success are accepted rather than one guessed at.
 receipt_status="$(cast receipt "$TX_HASH" status --rpc-url "$RPC_URL" 2>/dev/null | tr -d '[:space:]')"
-[[ "$receipt_status" == "1" ]] || die "the transaction did not succeed on chain (status $receipt_status)"
-note "transaction succeeded on chain"
+case "$receipt_status" in
+    1|true) note "transaction succeeded on chain" ;;
+    *) die "the transaction did not succeed on chain (status '$receipt_status')" ;;
+esac
 
 used="$(cast call "$SETTLEMENT" "nullifierUsed(bytes32)(bool)" "$NULLIFIER" \
     --rpc-url "$RPC_URL" | tr -d '[:space:]')"

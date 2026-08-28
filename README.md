@@ -160,8 +160,20 @@ are cheap. And verification costs about 3 M gas regardless, which is what makes
 proof aggregation the interesting optimisation rather than transaction
 batching.
 
-Throughput at N workers lands in Phase 3; `docs/BENCHMARKS.md` arrives in
-Phase 6.
+**A full settlement costs 3,760,144 gas** — measured by `make e2e`, which is
+the whole path rather than the verifier alone. The difference from the 3.01 M
+above is the settlement contract's own work: the authorisation check, the
+nullifier read and write, and the event. Consuming the nullifier is a cold
+storage write, and at roughly 20,000 gas it is a small fraction of verification.
+
+That ratio is the argument for deferring batching (ADR-004). Batching amortises
+the ~750 K of per-transaction overhead across several proofs; it does nothing
+about the ~3 M spent verifying each one. Proof aggregation attacks the part
+that actually dominates.
+
+Throughput under load is exercised by `make test-worker`: 100 jobs across 4
+workers, and the same run with workers killed mid-proof. `docs/BENCHMARKS.md`
+arrives in Phase 6.
 
 ## Deployed addresses
 
