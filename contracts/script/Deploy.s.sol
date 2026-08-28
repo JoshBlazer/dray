@@ -14,6 +14,11 @@ import {HonkVerifier as RangeProofVerifier} from "../src/verifiers/range_proof.s
 /// The deployer becomes the owner and is authorised as a relayer, which is
 /// convenient locally. On a real network the relayer should be a separate key,
 /// set with `setRelayer` after deployment; the owner key can then stay cold.
+///
+/// Dray runs a *set* of relayers (ADR-011), each with its own key so that each
+/// is the single writer to its own nonce. Pass their addresses in
+/// `DRAY_RELAYERS`, comma separated, and they are authorised here. Adding one
+/// later is a `setRelayer` call, not a redeploy.
 contract Deploy is Script {
     bytes32 internal constant MEMBERSHIP = keccak256("dray.circuit.membership");
     bytes32 internal constant RANGE_PROOF = keccak256("dray.circuit.range_proof");
@@ -31,6 +36,14 @@ contract Deploy is Script {
         settlement.registerCircuit(MEMBERSHIP, membershipVerifier);
         settlement.registerCircuit(RANGE_PROOF, rangeProofVerifier);
         settlement.setRelayer(deployer, true);
+
+        address[] memory relayers = vm.envOr("DRAY_RELAYERS", ",", new address[](0));
+        for (uint256 i = 0; i < relayers.length; i++) {
+            if (relayers[i] != deployer) {
+                settlement.setRelayer(relayers[i], true);
+                console.log("DRAY_RELAYER=%s", relayers[i]);
+            }
+        }
 
         vm.stopBroadcast();
 

@@ -45,7 +45,7 @@ pub const COMPONENT: &str = "dray-store";
 /// change what this code reads.
 const JOB_COLUMNS: &str = "id, circuit_id, job_hash, idempotency_key, inputs, \
      state::text AS state, attempts, max_attempts, submission_attempts, last_error, \
-     leased_by, proof, retry_after, created_at, updated_at";
+     leased_by, proof, public_inputs, retry_after, created_at, updated_at";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -139,6 +139,13 @@ pub struct Job {
     pub last_error: Option<String>,
     pub leased_by: Option<String>,
     pub proof: Option<Vec<u8>>,
+    /// The proof's public input vector, 32 bytes per field element. The
+    /// nullifier is the last one (ADR-008).
+    ///
+    /// Written in the same transaction as the proof, and the schema refuses a
+    /// `proved` job without both — a relayer holding a proof it cannot describe
+    /// could not submit it.
+    pub public_inputs: Option<Vec<u8>>,
     /// Earliest time this job may be leased again; `None` means immediately.
     /// Set by [`Store::record_failure`] when a retry is scheduled.
     pub retry_after: Option<chrono::DateTime<chrono::Utc>>,
@@ -163,6 +170,7 @@ impl Job {
             last_error: row.try_get("last_error")?,
             leased_by: row.try_get("leased_by")?,
             proof: row.try_get("proof")?,
+            public_inputs: row.try_get("public_inputs")?,
             retry_after: row.try_get("retry_after")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
@@ -556,6 +564,12 @@ impl Store {
     /// when the lease was lost, which the caller should treat as an instruction
     /// to abandon the work in progress.
     ///
+    /// All three in-flight states are renewable, `submitting` included. A
+    /// relayer waiting for confirmations holds its lease for as long as the
+    /// chain takes, and omitting its state here made every relayer heartbeat
+    /// return `false` — so a relayer abandoned its own work the moment a
+    /// settlement took longer than one heartbeat interval.
+    ///
     /// # Errors
     ///
     /// Propagates database failures.
@@ -570,7 +584,7 @@ impl Store {
              SET lease_expires_at = now() + make_interval(secs => $3)
              WHERE id = $1
                AND leased_by = $2
-               AND state IN ('leased', 'proving')",
+               AND state IN ('leased', 'proving', 'submitting')",
         )
         .bind(id)
         .bind(worker_id)
@@ -1037,15 +1051,23 @@ impl Store {
     ) -> Result<Job, StoreError> {
         let mut tx = self.pool.begin().await?;
 
+        // Only the live row, and `reorged_at` is left exactly as it is.
+        //
+        // Matching on the hash alone is not enough: a resubmission after a
+        // reorg rebuilds the *same* call at the same nonce and price, so it has
+        // the same transaction hash as the settlement that was unwound. An
+        // update that also cleared `reorged_at` would resurrect that historical
+        // row, leaving two live settlements for one nullifier — which the
+        // schema refuses, and rightly, because that is what a double
+        // submission looks like.
         sqlx::query(
             "UPDATE settlements SET
                  block_number        = $3,
                  confirmations       = $4,
                  gas_used            = $5,
                  effective_gas_price = $6::numeric,
-                 reorged_at          = NULL,
                  updated_at          = now()
-             WHERE job_id = $1 AND tx_hash = $2",
+             WHERE job_id = $1 AND tx_hash = $2 AND reorged_at IS NULL",
         )
         .bind(id)
         .bind(tx_hash)
@@ -1113,6 +1135,106 @@ impl Store {
 
         tx.commit().await?;
         Ok(job)
+    }
+
+    /// Point a live settlement at a replacement transaction.
+    ///
+    /// A bumped or re-nonced transaction is the *same settlement* — the same
+    /// proof consuming the same nullifier — carried by a different transaction
+    /// hash. Recording it as a second settlement would be wrong twice over: the
+    /// schema forbids two live rows for one nullifier (rightly, since that is
+    /// what a double submission looks like), and the confirmation path matches
+    /// on `tx_hash`, so a stale hash means a confirmed transaction updates
+    /// nothing and the row keeps naming a transaction that no longer exists.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures.
+    pub async fn replace_submission_tx(
+        &self,
+        id: Uuid,
+        from_tx: &[u8],
+        to_tx: &[u8],
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE settlements
+             SET tx_hash = $3, updated_at = now()
+             WHERE job_id = $1 AND tx_hash = $2 AND reorged_at IS NULL",
+        )
+        .bind(id)
+        .bind(from_tx)
+        .bind(to_tx)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Mark a job settled by a transaction this relayer did not send.
+    ///
+    /// Reached when the nullifier is already consumed on chain but this relayer
+    /// has no settlement of its own on record — an earlier attempt whose
+    /// broadcast was never written down, or another relayer that got there
+    /// first. The job *is* settled; refusing to say so would leave it retrying
+    /// against a contract that will reject it every time.
+    ///
+    /// Deliberately records no settlement row. The transaction hash is not
+    /// known here, and inventing one would put a lie in the audit trail; the
+    /// transition detail says what happened instead.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures and illegal transitions.
+    pub async fn mark_settled_elsewhere(
+        &self,
+        id: Uuid,
+        relayer_id: &str,
+        detail: &str,
+    ) -> Result<Job, StoreError> {
+        self.apply_event(
+            id,
+            JobEvent::SettlementConfirmed,
+            Some(relayer_id),
+            Some(detail),
+        )
+        .await
+    }
+
+    /// Settlements recent enough that a reorg could still unwind them.
+    ///
+    /// Returns `(job_id, tx_hash, nullifier)` for jobs that are currently
+    /// `settled`. Confirming to a depth makes a reorg unlikely, not impossible,
+    /// and `settled` is deliberately not a terminal state.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database failures.
+    pub async fn settlements_to_watch(
+        &self,
+        within: std::time::Duration,
+    ) -> Result<Vec<(Uuid, Vec<u8>, Vec<u8>)>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT s.job_id, s.tx_hash, s.nullifier
+             FROM settlements s
+             JOIN jobs j ON j.id = s.job_id
+             WHERE j.state = 'settled'
+               AND s.reorged_at IS NULL
+               AND s.updated_at > now() - make_interval(secs => $1)
+             ORDER BY s.updated_at DESC",
+        )
+        .bind(within.as_secs_f64())
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut watching = Vec::with_capacity(rows.len());
+        for row in &rows {
+            watching.push((
+                row.try_get("job_id")?,
+                row.try_get("tx_hash")?,
+                row.try_get("nullifier")?,
+            ));
+        }
+        Ok(watching)
     }
 
     /// Settlements that have been broadcast but are not yet confirmed to depth.

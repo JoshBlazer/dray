@@ -12,13 +12,17 @@ alloy = { version = "2.4.1", default-features = false, features = [
     "std",
     "contract",
     "network",
-    "provider-http",
     "providers",
+    # The transport itself. `providers` alone builds a provider that cannot
+    # connect to anything — it fails at runtime with "no transports enabled",
+    # which is a start-up failure rather than a compile error.
+    "reqwest",
     "rpc-types-eth",
     "signer-local",
     "sol-types",
 ] }
 dray-core.workspace = true
+dray-worker = { path = "../dray-worker" }
 dray-store.workspace = true
 serde_json = "1.0.151"
 thiserror = "2.0.20"
@@ -35,5 +39,7 @@ integration-tests = []
 workspace = true
 
 [dev-dependencies]
+# So integration tests can turn on the relayer's own logs when diagnosing.
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "migrate"] }
 tempfile = "3.27.0"

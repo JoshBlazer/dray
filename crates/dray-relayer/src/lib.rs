@@ -5,9 +5,11 @@
 //! relayer respond needs control over its lifetime, not just its output.
 
 pub mod chain;
+pub mod config;
 pub mod failure;
 pub mod gas;
 pub mod nonce;
+pub mod relayer;
 
 /// Component name used in logs and metrics.
 pub const COMPONENT: &str = "dray-relayer";

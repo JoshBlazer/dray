@@ -29,8 +29,8 @@ BB_BIN := $(HOME)/.bb
 FOUNDRY_BIN := $(FOUNDRY_DIR)/bin
 ZK_PATH := $(NARGO_BIN):$(BB_BIN):$(FOUNDRY_BIN)
 
-.PHONY: help setup setup-zk versions build test test-integration test-proving test-worker reset-test-db lint fmt up down clean seed api worker \
-        circuits contracts prove e2e-circuits e2e
+.PHONY: help setup setup-zk versions build test test-integration test-proving test-worker test-relayer reset-test-db lint fmt up down clean seed api worker relayer \
+        circuits contracts prove deploy e2e-circuits e2e
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -133,6 +133,22 @@ test-proving: ## Run the worker tests that shell out to a real nargo and bb (req
 	@# assert the worker reproduces the same nullifiers e2e-circuits settles.
 	PATH="$(ZK_PATH):$$PATH" $(CARGO) test -p dray-worker --features proving-tests
 
+relayer: ## Run a relayer against the local dependencies and a local chain
+	@# DRAY_RELAYER_KEY and DRAY_SETTLEMENT have no defaults: a key cannot have
+	@# one, and a relayer pointed at the wrong contract fails every job.
+	PATH="$(ZK_PATH):$$PATH" DATABASE_URL="$(DATABASE_URL)" $(CARGO) run -p dray-relayer
+
+test-relayer: ## Run the relayer tests against Anvil (needs make up, setup-zk and prove)
+	@# Each test starts its own Anvil. They need proofs on disk, because they
+	@# settle real ones rather than fixtures.
+	@test -f circuits/target/membership/proof || { \
+		echo "no proofs on disk. Run: make prove"; exit 1; }
+	@$(COMPOSE) exec -T postgres psql -U dray -d dray -tAc \
+		"SELECT 1 FROM pg_database WHERE datname='dray_test'" | grep -q 1 || \
+		$(COMPOSE) exec -T postgres psql -U dray -d dray -c "CREATE DATABASE dray_test"
+	PATH="$(ZK_PATH):$$PATH" DATABASE_URL="$(TEST_DATABASE_URL)" \
+		$(CARGO) test -p dray-relayer --features integration-tests --test anvil -- --test-threads 2
+
 test-worker: ## Run the whole-worker tests: load and chaos (needs make up and make setup-zk)
 	@# These need a live Postgres *and* the proving toolchain, which is why they
 	@# are separate from both test-integration and test-proving.
@@ -154,6 +170,11 @@ contracts: ## Build contracts and run the Foundry suite (needs proofs; run make 
 
 prove: ## Generate proofs and Solidity verifiers for every circuit
 	@bash scripts/prove.sh
+
+deploy: ## Deploy the settlement stack. Set DRAY_RPC_URL, PRIVATE_KEY, DRAY_RELAYERS
+	@test -n "$$PRIVATE_KEY" || { echo "PRIVATE_KEY must be set"; exit 1; }
+	cd contracts && PATH="$(ZK_PATH):$$PATH" forge script script/Deploy.s.sol:Deploy \
+		--rpc-url "$${DRAY_RPC_URL:-http://127.0.0.1:8545}" --broadcast
 
 e2e-circuits: ## Phase 1 end-to-end: input -> proof -> on-chain verification on Anvil
 	@bash scripts/e2e-circuits.sh
