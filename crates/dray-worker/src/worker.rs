@@ -222,15 +222,29 @@ impl Worker {
                 break;
             }
 
-            let leased = tokio::select! {
-                biased;
-                () = shutdown.requested() => break,
-                leased = self.store.lease_next(&self.config.worker_id, self.config.lease_ttl) => leased,
-            };
+            // Deliberately *not* raced against shutdown. Leasing commits a
+            // database transaction, so a cancelled future can leave the job
+            // leased with nobody proving it — stuck until its lease expires,
+            // which is exactly the delay graceful shutdown exists to avoid.
+            // Take the lease, then decide.
+            let leased = self
+                .store
+                .lease_next(&self.config.worker_id, self.config.lease_ttl)
+                .await;
 
             match leased {
                 Ok(Some(job)) => {
                     let id = job.id;
+
+                    if shutdown.is_requested() {
+                        tracing::info!(job = %id, "shutting down; handing the job straight back");
+                        if let Err(err) = self.store.release_lease(id, &self.config.worker_id).await
+                        {
+                            tracing::warn!(job = %id, error = %err, "could not release the lease");
+                        }
+                        break;
+                    }
+
                     let outcome = self.attempt(job, &mut shutdown).await;
                     self.metrics.record_outcome(outcome.metric_label());
                     tracing::info!(job = %id, outcome = ?outcome, "attempt finished");

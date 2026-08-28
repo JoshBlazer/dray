@@ -2002,3 +2002,57 @@ async fn a_job_settled_elsewhere_is_recorded_without_a_fabricated_transaction() 
         "the transition should still be logged: {history:?}"
     );
 }
+
+/// Releasing a lease returns the job to *its* queue, which depends on how far
+/// it got. A relayer's job goes back to `proved`, not `queued` — re-proving a
+/// job whose proof already exists, because a process was asked to shut down,
+/// would throw away seconds of CPU for nothing.
+#[tokio::test]
+async fn releasing_a_submission_lease_returns_the_job_to_the_submit_queue() {
+    let store = isolated_store("release_submitting").await;
+    let id = proved_job(&store).await;
+
+    store
+        .lease_next_proved("relayer-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let job = store.release_lease(id, "relayer-1").await.unwrap();
+
+    assert_eq!(
+        job.state,
+        JobState::Proved,
+        "`Submitting` has no lease-expired transition; releasing must not \
+         attempt one"
+    );
+    assert!(job.proof.is_some(), "the proof is kept");
+    assert!(job.leased_by.is_none());
+
+    // Immediately available again, rather than waiting out the lease.
+    let leased = store
+        .lease_next_proved("relayer-2", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("a released job should be takeable at once");
+    assert_eq!(leased.id, id);
+}
+
+/// And a worker's job goes back to `queued`, because there is no proof yet.
+#[tokio::test]
+async fn releasing_a_proving_lease_returns_the_job_to_the_proving_queue() {
+    let store = isolated_store("release_proving").await;
+    let ids = seed_jobs(&store, 1).await;
+
+    store
+        .lease_next("worker-1", Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    store.begin_proving(ids[0], "worker-1").await.unwrap();
+
+    let job = store.release_lease(ids[0], "worker-1").await.unwrap();
+
+    assert_eq!(job.state, JobState::Queued);
+    assert!(job.leased_by.is_none());
+}

@@ -234,17 +234,30 @@ impl Relayer {
                 break;
             }
 
-            let leased = tokio::select! {
-                biased;
-                () = shutdown.requested() => break,
-                leased = self
-                    .store
-                    .lease_next_proved(&self.config.relayer_id, self.config.lease_ttl) => leased,
-            };
+            // Deliberately *not* raced against shutdown. Leasing commits a
+            // database transaction, so a cancelled future can leave the job
+            // leased with nobody working on it — stuck in `submitting` until
+            // its lease expires, which is exactly the delay graceful shutdown
+            // exists to avoid. Take the lease, then decide.
+            let leased = self
+                .store
+                .lease_next_proved(&self.config.relayer_id, self.config.lease_ttl)
+                .await;
 
             match leased {
                 Ok(Some(job)) => {
                     let id = job.id;
+
+                    if shutdown.is_requested() {
+                        tracing::info!(job = %id, "shutting down; handing the job straight back");
+                        if let Err(err) =
+                            self.store.release_lease(id, &self.config.relayer_id).await
+                        {
+                            tracing::warn!(job = %id, error = %err, "could not release the lease");
+                        }
+                        break;
+                    }
+
                     let outcome = self.attempt(job, &mut shutdown).await;
                     tracing::info!(job = %id, outcome = ?outcome, "settlement attempt finished");
                     outcomes.push(outcome);
@@ -365,7 +378,46 @@ impl Relayer {
             Ok(Some(existing)) if existing.reorged_at.is_none() => {
                 if let Some(tx_hash) = to_b256(&existing.tx_hash) {
                     tracing::info!(job = %id, tx = %tx_hash, "resuming an earlier broadcast");
-                    return self.track(id, tx_hash, nullifier, None).await;
+
+                    // Recover the nonce and price from the transaction itself,
+                    // so a resumed broadcast can still be replaced if it is
+                    // stuck. Without this a relayer restarted mid-submission
+                    // would wait on it for ever, unable to bump it and unable
+                    // to safely re-nonce around it.
+                    let resumable = match self.chain.transaction_terms(tx_hash).await {
+                        Ok(Some((nonce, fees))) => {
+                            let circuit = crate::chain::circuit_id(&job.circuit_id);
+                            let gas_limit = self
+                                .chain
+                                .estimate_settle_gas(circuit, proof, &public_inputs)
+                                .await
+                                .map_or(DEFAULT_GAS_LIMIT, GasPolicy::gas_limit);
+
+                            Some((
+                                Replaceable {
+                                    nonce,
+                                    circuit,
+                                    proof,
+                                    public_inputs: &public_inputs,
+                                    gas_limit,
+                                },
+                                fees,
+                            ))
+                        }
+                        // The node has forgotten it, so there is nothing to
+                        // replace; the tracker will notice it never mines.
+                        Ok(None) => None,
+                        Err(err) => {
+                            tracing::warn!(
+                                job = %id,
+                                error = %err,
+                                "could not read the resumed transaction's terms"
+                            );
+                            None
+                        }
+                    };
+
+                    return self.track(id, tx_hash, nullifier, resumable).await;
                 }
             }
             Ok(_) => {}
@@ -858,6 +910,13 @@ struct Replaceable<'a> {
     public_inputs: &'a [B256],
     gas_limit: u64,
 }
+
+/// Gas limit assumed when an estimate is unavailable on the resume path.
+///
+/// Generous: a settlement measured at ~3.8M gas, rounded well up. Unused gas is
+/// refunded, and the alternative — abandoning a resumed transaction because the
+/// estimator was momentarily unreachable — costs far more.
+const DEFAULT_GAS_LIMIT: u64 = 6_000_000;
 
 enum Confirmation {
     Settled,

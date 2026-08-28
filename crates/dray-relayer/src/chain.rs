@@ -15,6 +15,7 @@
 //! depth.
 
 use alloy::{
+    consensus::Transaction as _,
     network::{EthereumWallet, TransactionBuilder},
     primitives::{Address, B256, Bytes, FixedBytes, U256},
     providers::{DynProvider, Provider, ProviderBuilder},
@@ -302,6 +303,48 @@ impl Chain {
             gas_used: receipt.gas_used,
             effective_gas_price: receipt.effective_gas_price,
         }))
+    }
+
+    /// The nonce and fees of a transaction the node still knows about.
+    ///
+    /// Used when resuming a broadcast made by a previous process. Without it a
+    /// resumed transaction could never be replaced: bumping needs the original
+    /// nonce, and re-deriving that from the account would race the transaction
+    /// already in flight. A relayer restarted while a transaction was stuck
+    /// would otherwise wait for it for ever.
+    ///
+    /// Returns `None` when the node has forgotten it, which means it was
+    /// dropped from the mempool and there is nothing to replace.
+    ///
+    /// # Errors
+    ///
+    /// Propagates RPC failures.
+    pub async fn transaction_terms(
+        &self,
+        tx_hash: B256,
+    ) -> Result<Option<(u64, Fees)>, ChainError> {
+        let transaction = self
+            .provider
+            .get_transaction_by_hash(tx_hash)
+            .await
+            .map_err(|e| ChainError::Rpc(format!("{e}")))?;
+
+        let Some(transaction) = transaction else {
+            return Ok(None);
+        };
+
+        // A legacy transaction has no separate priority fee; its gas price is
+        // both what it pays in total and what the proposer receives.
+        let max_fee = transaction.max_fee_per_gas();
+        let priority = transaction.max_priority_fee_per_gas().unwrap_or(max_fee);
+
+        Ok(Some((
+            transaction.nonce(),
+            Fees {
+                max_fee_per_gas: max_fee,
+                max_priority_fee_per_gas: priority.min(max_fee),
+            },
+        )))
     }
 
     /// Whether a nullifier has already been consumed on chain.

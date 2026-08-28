@@ -902,22 +902,52 @@ impl Store {
         Job::from_row(&updated)
     }
 
-    /// Release a lease without failing the job, returning it to the queue.
+    /// Release a lease without failing the job, returning it to its queue.
     ///
-    /// Used by graceful shutdown: a worker told to stop should hand its job
-    /// back immediately rather than make the next worker wait out the lease TTL.
+    /// Used by graceful shutdown: a process told to stop should hand its job
+    /// back immediately rather than make the next one wait out the lease TTL.
+    ///
+    /// *Its* queue, not *the* queue. Which queue that is depends on how far the
+    /// job got: a worker's job goes back to `queued` to be proved again, but a
+    /// relayer's goes back to `proved`, because the proof already exists and
+    /// re-proving it would throw away seconds of CPU over a shutdown. The state
+    /// machine encodes this — `Submitting` has no `LeaseExpired` transition at
+    /// all — so the event is chosen here rather than left to every caller to
+    /// get right.
     ///
     /// # Errors
     ///
     /// Propagates database failures and illegal transitions.
-    pub async fn release_lease(&self, id: Uuid, worker_id: &str) -> Result<Job, StoreError> {
-        self.apply_event(
+    pub async fn release_lease(&self, id: Uuid, holder: &str) -> Result<Job, StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        let current = sqlx::query("SELECT state::text AS state FROM jobs WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::JobNotFound(id))?;
+
+        let state_name: String = current.try_get("state")?;
+        let from = JobState::from_str(&state_name)
+            .map_err(|e| StoreError::Corrupt(format!("job.state: {e}")))?;
+
+        let event = if from == JobState::Submitting {
+            JobEvent::RetryScheduled
+        } else {
+            JobEvent::LeaseExpired
+        };
+
+        let job = Self::apply_event_in_tx(
+            &mut tx,
             id,
-            JobEvent::LeaseExpired,
-            Some(worker_id),
-            Some("released on worker shutdown"),
+            event,
+            Some(holder),
+            Some("released on shutdown"),
         )
-        .await
+        .await?;
+
+        tx.commit().await?;
+        Ok(job)
     }
 
     // -----------------------------------------------------------------------
