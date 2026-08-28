@@ -179,7 +179,5 @@ deploy: ## Deploy the settlement stack. Set DRAY_RPC_URL, PRIVATE_KEY, DRAY_RELA
 e2e-circuits: ## Phase 1 end-to-end: input -> proof -> on-chain verification on Anvil
 	@bash scripts/e2e-circuits.sh
 
-e2e: ## End-to-end: API through to on-chain settlement (Phase 4)
-	@echo "make e2e is not implemented yet — it lands in Phase 4."
-	@echo "See PROGRESS.md for current phase status."
-	@exit 1
+e2e: ## End-to-end: HTTP request through to on-chain settlement
+	@PATH="$(ZK_PATH):$$PATH" bash scripts/e2e.sh

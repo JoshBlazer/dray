@@ -56,6 +56,7 @@ make test             # unit and property tests, no database needed
 make test-integration # tests that need the live Postgres and Redis
 make api              # run the ingest API on :8080
 make worker           # run a proving worker (needs make setup-zk)
+make e2e              # the whole path: HTTP request -> proof -> settled on chain
 ```
 
 Then submit a proof request:
@@ -85,8 +86,15 @@ proof and public inputs within a few seconds. `make test-worker` runs the pool
 under load and under chaos: 100 jobs across 4 workers, and the same run with
 workers killed mid-proof.
 
-**Nothing settles that proof on chain yet.** The relayer is Phase 4; today a
-proved job stays `proved`.
+With `make relayer` running too, the proof is submitted, confirmed, and
+recorded — and if a reorg unwinds it, the job goes back on the submit queue and
+is settled again.
+
+`make e2e` runs that whole path in one command: it starts a local chain,
+deploys the settlement stack, runs the API, a worker and a relayer, submits one
+request over HTTP, and waits for the proof to be verified on chain. The final
+assertion is a `cast call` against the contract, so it comes from the chain
+rather than from Dray's record of it.
 
 For the circuits and contracts, `make setup-zk` installs the proving toolchain
 at the exact pinned versions below; `make versions` reports what you have
@@ -101,7 +109,7 @@ against what is expected.
 Installing latest-of-both does **not** work today — see
 [ADR-002](DECISIONS.md) for the details.
 
-`make e2e` — clone to first settled proof — arrives in Phase 4.
+`make e2e` goes from a clean clone to a settled proof in one command.
 
 ## How it works
 
@@ -123,10 +131,17 @@ properly in `docs/DESIGN.md` in Phase 6.
    input. Peak memory is sampled from the kernel's own high-water mark, so the
    ceilings can be checked against what proving actually costs rather than
    against what it cost once.
-4. **Nonce and gas management.** The relayer is the single writer to its
-   account nonce. Submissions are serialised, stuck transactions are bumped and
-   replaced under a ceiling, and settlement is confirmed to N blocks to survive
-   reorgs.
+4. **Nonce and gas management.** Each relayer holds its own key, so each is the
+   single writer to its own nonce, and the lock is held across the whole
+   submission rather than just the allocation — otherwise two transactions can
+   be broadcast out of order and a permanent failure on the earlier one strands
+   the later one for ever. Stuck transactions are replaced at a higher price
+   under a ceiling, raising *both* EIP-1559 fees because nodes check both
+   against their 10% replacement rule. A transaction whose nonce is ahead of
+   the account's is not underpriced but unreachable, so that case is detected
+   and re-broadcast rather than bid up. Settlement is confirmed to N blocks and
+   then watched, because confirming to a depth makes a reorg unlikely, not
+   impossible.
 
 ## Benchmarks
 
